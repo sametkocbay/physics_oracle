@@ -1,0 +1,146 @@
+"""§5.7 — Run the steady-state incompressible solver and monitor convergence.
+
+In OpenFOAM 13 simpleFoam is superseded by foamRun -solver incompressibleFluid.
+Sources OF 13's bashrc, runs the solver, captures the log, and parses
+residuals + force coefficients for downstream extraction (§6.4) and QC (§7).
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+from pathlib import Path
+
+from common import setup_logging
+
+LOG = setup_logging()
+
+OPENFOAM_BASHRC = "/opt/openfoam13/etc/bashrc"
+
+
+def run_simple_foam(of_case_dir: Path, log_path: Path | None = None,
+                    timeout: int = 60 * 60 * 6) -> int:
+    """Run foamRun -solver incompressibleFluid in `of_case_dir`. Returns the exit code.
+
+    OpenFOAM 13 replaced simpleFoam with foamRun -solver incompressibleFluid.
+    OF 13 needs its bashrc sourced; we wrap the call in a bash -lc.
+    The log is written to simpleFoam.log for compatibility with the log parser.
+    """
+    log_path = log_path or (of_case_dir / "simpleFoam.log")
+    cmd = (
+        f"set -e && "
+        f"if [ -z \"${{WM_PROJECT_DIR:-}}\" ]; then source {OPENFOAM_BASHRC}; fi && "
+        f"cd {of_case_dir.resolve()} && foamRun -solver incompressibleFluid"
+    )
+    LOG.info("[%s] running foamRun (timeout %ds) — log %s",
+             of_case_dir.name, timeout, log_path.name)
+    with log_path.open("w") as f:
+        proc = subprocess.run(
+            ["bash", "-lc", cmd],
+            stdout=f, stderr=subprocess.STDOUT,
+            timeout=timeout, check=False,
+        )
+    LOG.info("[%s] foamRun exit %d", of_case_dir.name, proc.returncode)
+    return proc.returncode
+
+
+# ---------------------------------------------------------------------------
+# Log parsing
+# ---------------------------------------------------------------------------
+
+# OF residuals look like:
+# smoothSolver:  Solving for Ux, Initial residual = 1.5e-3, Final residual = 2e-5, ...
+# DICPCG:  Solving for p, Initial residual = ...
+RES_RE = re.compile(
+    r"Solving for (?P<field>\w+),\s+Initial residual\s*=\s*(?P<res>[\d.eE+-]+)"
+)
+# OF13 prints "Time = 1s" (with units suffix); also tolerate plain numbers.
+TIME_RE = re.compile(r"^Time\s*=\s*[\d.eE+-]+s?\s*$", re.MULTILINE)
+
+
+def parse_solver_log(log_text: str) -> dict:
+    """Return per-iteration residual history and final iteration count."""
+    fields = ["Ux", "Uy", "p", "k", "omega"]
+    history: dict[str, list[float]] = {f: [] for f in fields}
+
+    # Split log by "Time = N" blocks; inside each block collect first residual
+    # for each field (multiple non-orthogonal correctors may report several).
+    blocks = TIME_RE.split(log_text)
+    # blocks[0] is preamble; subsequent are per-iteration
+    for block in blocks[1:]:
+        seen: set[str] = set()
+        for m in RES_RE.finditer(block):
+            field = m.group("field")
+            if field in history and field not in seen:
+                history[field].append(float(m.group("res")))
+                seen.add(field)
+        # Pad missing fields with NaN so columns stay aligned
+        for f in fields:
+            if f not in seen:
+                history[f].append(float("nan"))
+
+    n_iter = len(history["Ux"])
+    final = {
+        f: (history[f][-1] if history[f] and not _isnan(history[f][-1]) else None)
+        for f in fields
+    }
+    return {
+        "n_iter": n_iter,
+        "history": history,
+        "final": final,
+        "fields": fields,
+    }
+
+
+def _isnan(x: float) -> bool:
+    return x != x
+
+
+# ---------------------------------------------------------------------------
+# Convergence detection
+# ---------------------------------------------------------------------------
+
+def detect_convergence(history: dict[str, list[float]]) -> dict:
+    """Apply §5.7 criterion: residuals dropped ≥ 4 orders of magnitude."""
+    drops: dict[str, float] = {}
+    converged_fields: dict[str, bool] = {}
+    for field, vals in history.items():
+        clean = [v for v in vals if not _isnan(v) and v > 0]
+        if len(clean) < 2:
+            drops[field] = 0.0
+            converged_fields[field] = False
+            continue
+        ratio = clean[0] / clean[-1]
+        import math
+        drop = math.log10(ratio) if ratio > 0 else 0.0
+        drops[field] = drop
+        converged_fields[field] = drop >= 4.0
+    overall = all(converged_fields.values()) if converged_fields else False
+    return {"drops": drops, "fields": converged_fields, "overall": overall}
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run simpleFoam in an OpenFOAM case dir.")
+    p.add_argument("of_case", type=Path)
+    p.add_argument("--timeout", type=int, default=6 * 3600)
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    rc = run_simple_foam(args.of_case, timeout=args.timeout)
+    log = (args.of_case / "simpleFoam.log").read_text(errors="replace")
+    parsed = parse_solver_log(log)
+    LOG.info("Iterations: %d, final residuals: %s", parsed["n_iter"], parsed["final"])
+    conv = detect_convergence(parsed["history"])
+    LOG.info("Drops: %s   Converged: %s", conv["drops"], conv["overall"])
+    raise SystemExit(rc)
+
+
+if __name__ == "__main__":
+    main()
