@@ -56,6 +56,7 @@ from common import (
 )
 from generate_geometry import assign_splits, sample_naca_profiles
 from generate_mesh import generate_mesh
+from generate_c_mesh import generate_c_mesh
 from setup_openfoam_case import setup_openfoam_case
 from run_openfoam import run_simple_foam
 from extract_fields import extract_case
@@ -278,7 +279,8 @@ def run_case(spec: CaseSpec, args: argparse.Namespace, solver_hash: str) -> dict
                          "flags": ["dry_run"], "metrics": {"n_iter": 0,
                                                             "converged": False}}
         else:
-            mesh_quality = generate_mesh(spec.of_case_dir, spec.case_id)
+            mesher = generate_c_mesh if args.c_mesh else generate_mesh
+            mesh_quality = mesher(spec.of_case_dir, spec.case_id)
             rc = run_simple_foam(spec.of_case_dir,
                                  timeout=args.solver_timeout)
             if rc != 0:
@@ -344,6 +346,11 @@ def parse_args() -> argparse.Namespace:
                    help="Solver endTime (§5.7 max iterations).")
     p.add_argument("--solver-timeout", type=int, default=6 * 3600,
                    help="Per-case solver wall-clock timeout (seconds).")
+    p.add_argument("--c-mesh", action="store_true",
+                   help="Use the structured C-mesh generator (generate_c_mesh.py) "
+                        "instead of the default Gmsh unstructured mesher. Closed-TE "
+                        "airfoil + bisector wake + half-circle far-field; written via "
+                        "the same gmshToFoam path as the default mesher.")
     p.add_argument("--skip-of", action="store_true",
                    help="Skip mesh generation, solver, and extraction (manifest+meta only).")
     p.add_argument("--cases", nargs="*",
