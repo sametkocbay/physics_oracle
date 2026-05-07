@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import fcntl
 from pathlib import Path
 
 import h5py
@@ -102,16 +103,19 @@ def quality_check(case_dir: Path, max_iter: int = ITER_LIMIT) -> dict:
 def append_rejection(case_id: str, reasons: list[str],
                      log_path: Path = REJECTION_LOG_PATH) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    new = not log_path.exists()
     with log_path.open("a", newline="") as f:
-        w = csv.writer(f)
-        if new:
-            w.writerow(["case_id", "reason", "timestamp"])
-        w.writerow([
-            case_id,
-            ";".join(reasons) if reasons else "unknown",
-            dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        ])
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            w = csv.writer(f)
+            if f.seek(0, 2) == 0:  # empty file — write header
+                w.writerow(["case_id", "reason", "timestamp"])
+            w.writerow([
+                case_id,
+                ";".join(reasons) if reasons else "unknown",
+                dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            ])
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------

@@ -26,6 +26,7 @@ import json
 import math
 import time
 import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 
@@ -349,6 +350,8 @@ def parse_args() -> argparse.Namespace:
                    help="Run only these case IDs (must already be in the sampled set).")
     p.add_argument("--repro-cases", type=int, default=0,
                    help="At the end, hash N accepted cases for the §9 repro checklist.")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Number of cases to run in parallel (default: 1 = serial).")
     return p.parse_args()
 
 
@@ -384,13 +387,36 @@ def main() -> None:
     n_accepted = 0
     n_rejected = 0
     t0 = time.time()
-    for i, spec in enumerate(all_cases, 1):
-        LOG.info("--- case %d / %d ---", i, len(all_cases))
-        result = run_case(spec, args, solver_hash)
-        if result.get("accepted"):
-            n_accepted += 1
-        else:
-            n_rejected += 1
+
+    if args.workers > 1:
+        LOG.info("Running %d cases with %d parallel workers", len(all_cases), args.workers)
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(run_case, spec, args, solver_hash): spec
+                       for spec in all_cases}
+            n_done = 0
+            for fut in as_completed(futures):
+                spec = futures[fut]
+                n_done += 1
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    LOG.error("[%s] worker raised: %s", spec.case_id, exc)
+                    result = {"accepted": False}
+                if result.get("accepted"):
+                    n_accepted += 1
+                else:
+                    n_rejected += 1
+                LOG.info("Progress %d/%d — accepted %d  rejected %d  [%s]",
+                         n_done, len(all_cases), n_accepted, n_rejected, spec.case_id)
+    else:
+        for i, spec in enumerate(all_cases, 1):
+            LOG.info("--- case %d / %d ---", i, len(all_cases))
+            result = run_case(spec, args, solver_hash)
+            if result.get("accepted"):
+                n_accepted += 1
+            else:
+                n_rejected += 1
+
     dt_s = time.time() - t0
 
     LOG.info("DONE: %d accepted, %d rejected in %.1f s", n_accepted, n_rejected, dt_s)
