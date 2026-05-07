@@ -1,8 +1,7 @@
 """§5 — Build the OpenFOAM case directory tree for one case.
 
-Writes 0/{U,p,k,omega,nut,phi}, constant/{turbulenceProperties,
-momentumTransport,transportProperties,physicalProperties}, and
-system/{controlDict,fvSchemes,fvSolution} with values substituted from the
+Writes 0/{U,p,k,omega,nut,phi}, constant/{momentumTransport,physicalProperties},
+and system/{controlDict,fvSchemes,fvSolution} with values substituted from the
 case spec.
 
 The 2D simulation uses a 1-cell-thick extruded mesh with frontAndBack=empty
@@ -150,7 +149,7 @@ boundaryField
 # constant/
 # ---------------------------------------------------------------------------
 
-TURBULENCE_PROPERTIES = (FOAM_HEADER + """
+MOMENTUM_TRANSPORT = (FOAM_HEADER + """
 simulationType  RAS;
 
 RAS
@@ -160,18 +159,6 @@ RAS
     turbulence      on;
     printCoeffs     on;
 }}
-""")
-
-
-# OF13 reads constant/momentumTransport instead of (or in addition to)
-# turbulenceProperties; we write both for portability.
-MOMENTUM_TRANSPORT = TURBULENCE_PROPERTIES
-
-
-TRANSPORT_PROPERTIES = (FOAM_HEADER + """
-transportModel  Newtonian;
-
-nu              [0 2 -1 0 0 0 0] {nu:.6e};
 """)
 
 
@@ -394,12 +381,8 @@ def write_zero_dir(zero_dir: Path, spec: CaseSpec) -> None:
 
 def write_constant_dir(constant_dir: Path, spec: CaseSpec) -> None:
     constant_dir.mkdir(parents=True, exist_ok=True)
-    (constant_dir / "turbulenceProperties").write_text(
-        TURBULENCE_PROPERTIES.format(cls="dictionary", obj="turbulenceProperties"))
     (constant_dir / "momentumTransport").write_text(
         MOMENTUM_TRANSPORT.format(cls="dictionary", obj="momentumTransport"))
-    (constant_dir / "transportProperties").write_text(
-        TRANSPORT_PROPERTIES.format(cls="dictionary", obj="transportProperties", nu=NU))
     (constant_dir / "physicalProperties").write_text(
         PHYSICAL_PROPERTIES.format(cls="dictionary", obj="physicalProperties", nu=NU))
 
