@@ -292,21 +292,77 @@ PATCH_TYPES = {
     "outlet":        ("patch", "patch"),
 }
 
+# createPatch dict that merges the open-TE base faces (defaultFaces) into
+# airfoilWalls.  gmshToFoam cannot assign those faces to a physical group
+# because they arise from the BL extrusion corner between curve 201 and
+# curve 202, not from a named curve in the .geo file.
+_CREATE_PATCH_DICT = """\
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      createPatchDict;
+}
+
+pointSync false;
+
+patches
+(
+    {
+        name airfoilWalls;
+        patchInfo
+        {
+            type            wall;
+            physicalType    wall;
+        }
+        constructFrom patches;
+        patches (airfoilWalls defaultFaces);
+    }
+);
+"""
+
+
+def merge_default_faces_to_airfoil_walls(of_case_dir: Path) -> None:
+    """Merge defaultFaces (open-TE base) into airfoilWalls via createPatch.
+
+    The open trailing edge introduces a short TE base line (curve 202).  After
+    BL extrusion and gmshToFoam conversion the corner faces at the TE junction
+    land in defaultFaces because they have no Gmsh physical-group assignment.
+    createPatch absorbs them into airfoilWalls so every face on the airfoil
+    surface carries the correct wall BC.
+    """
+    boundary_path = of_case_dir / "constant" / "polyMesh" / "boundary"
+    if "defaultFaces" not in boundary_path.read_text():
+        return
+
+    LOG.info("defaultFaces detected — merging open-TE base faces into airfoilWalls")
+    dict_path = of_case_dir / "system" / "createPatchDict"
+    dict_path.write_text(_CREATE_PATCH_DICT)
+    try:
+        res = subprocess.run(
+            ["createPatch", "-overwrite"],
+            cwd=of_case_dir, capture_output=True, text=True, timeout=120,
+        )
+        (of_case_dir / "createPatch.log").write_text(res.stdout + res.stderr)
+        if res.returncode != 0:
+            raise RuntimeError(f"createPatch failed for {of_case_dir.parent.name}: "
+                               "see createPatch.log")
+    finally:
+        dict_path.unlink(missing_ok=True)
+
 
 def patch_boundary_file(boundary_path: Path) -> None:
     """Re-type patches in constant/polyMesh/boundary after gmshToFoam.
 
-    If gmshToFoam reports a `defaultFaces` patch this function still raises
-    via simpleFoam later (no field has a defaultFaces BC entry).  That is
-    intentional — it catches a real meshing bug rather than papering over
-    it.  The likely cause is a duplicate vertex on the airfoil polyline at
-    LE or TE; check `naca4_coordinates` if you see this.
+    Call merge_default_faces_to_airfoil_walls() before this function so that
+    open-TE defaultFaces are absorbed into airfoilWalls first.  Any remaining
+    defaultFaces entry here indicates an unexpected meshing problem (e.g. a
+    duplicate vertex at LE or TE in naca4_coordinates).
     """
     text = boundary_path.read_text()
     if "defaultFaces" in text:
-        LOG.warning("polyMesh contains defaultFaces — fan extrusion likely "
-                    "produced unclassified TE faces.  Subsequent simpleFoam "
-                    "will fail; investigate the airfoil polyline.")
+        LOG.warning("polyMesh still contains defaultFaces after createPatch — "
+                    "unexpected meshing artifact; simpleFoam will likely fail.")
     for name, (typ, phys) in PATCH_TYPES.items():
         block_re = re.compile(
             rf"({name}\s*\{{[^}}]*?)type\s+\w+;([^}}]*?)physicalType\s+\w+;",
@@ -385,6 +441,7 @@ def generate_mesh(of_case_dir: Path, case_id: str) -> dict:
         raise RuntimeError(f"gmshToFoam failed for {case_id}: see gmshToFoam.log")
     msh_path.unlink(missing_ok=True)
 
+    merge_default_faces_to_airfoil_walls(of_case_dir)
     patch_boundary_file(of_case_dir / "constant" / "polyMesh" / "boundary")
 
     LOG.info("[%s] checkMesh", case_id)

@@ -111,7 +111,7 @@ def sample_ood_cases(profiles: list[dict], n_ood: int, seed: int) -> list[CaseSp
     rng = np.random.default_rng(seed + 2)
     codes = [p["naca_code"] for p in profiles]
     cases: list[CaseSpec] = []
-    if not codes:
+    if not codes or n_ood == 0:
         return cases
     per_kind = max(1, n_ood // 3)
     # high AoA

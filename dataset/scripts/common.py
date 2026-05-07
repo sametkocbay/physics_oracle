@@ -40,7 +40,7 @@ ENVELOPE = {
     "aoa_min_deg": -5.0,
     "aoa_max_deg": 15.0,
     "re_min": 1.0e5,
-    "re_max": 1.0e7,
+    "re_max": 5.0e5,
     "camber_pct_min": 0.0,
     "camber_pct_max": 6.0,
     "camber_pos_pct_min": 20.0,

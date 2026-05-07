@@ -155,7 +155,6 @@ simulationType  RAS;
 RAS
 {{
     model           kOmegaSST;
-    RASModel        kOmegaSST;
     turbulence      on;
     printCoeffs     on;
 }}
