@@ -37,7 +37,9 @@ DOMAIN_CHORDS_VERTICAL = 20.0
 
 LC_FAR = 0.8                           # far-field cell size (coarser → fewer cells)
 LC_WAKE = 0.05                         # wake refinement
-LC_AIRFOIL_BASE = 0.006                # tangential along airfoil
+LC_AIRFOIL_BASE = 0.006                # tangential cell size along airfoil (mid-chord / TE)
+LC_LE = 0.003                          # finer tangential size at leading edge (half of base)
+LE_REFINE_CHORD_FRAC = 0.15            # apply LC_LE to surface points within this chord fraction of LE
 
 # §4.2 wants 30+ cells in the boundary layer with growth < 1.2.
 BL_LAYERS = 30
@@ -92,6 +94,7 @@ eps   = 1e-6;
 
 lcFar  = {lc_far};
 lcNear = {lc_near};
+lcLE   = {lc_le};
 lcWake = {lc_wake};
 
 nBLayers   = {bl_layers};
@@ -140,6 +143,7 @@ def write_geo(geo_path: Path, case_id: str, coords: np.ndarray, re_value: float)
         y_max=DOMAIN_CHORDS_VERTICAL * CHORD,
         lc_far=LC_FAR,
         lc_near=LC_AIRFOIL_BASE,
+        lc_le=LC_LE,
         lc_wake=LC_WAKE,
         bl_layers=BL_LAYERS,
         bl_growth=BL_GROWTH,
@@ -152,7 +156,8 @@ def write_geo(geo_path: Path, case_id: str, coords: np.ndarray, re_value: float)
     point_ids = list(range(point_id_start, point_id_start + len(coords)))
     lines.append("\n// Airfoil surface points (TE -> upper -> LE -> lower -> TE, cosine-spaced)")
     for pid, (x, y) in zip(point_ids, coords):
-        lines.append(f"Point({pid}) = {{{x:.10f}, {y:.10f}, 0.0, lcNear}};")
+        lc_tag = "lcLE" if x < LE_REFINE_CHORD_FRAC * CHORD else "lcNear"
+        lines.append(f"Point({pid}) = {{{x:.10f}, {y:.10f}, 0.0, {lc_tag}}};")
 
     # ---- airfoil spline: single continuous BSpline, close TE with a short line ----
     # With the open-TE NACA formula, upper TE and lower TE are distinct
@@ -407,7 +412,7 @@ def generate_mesh(of_case_dir: Path, case_id: str) -> dict:
     the boundary file.
     """
     parsed = parse_case_id(case_id)
-    coords = naca4_coordinates(parsed["naca_code"], n_points=160)
+    coords = naca4_coordinates(parsed["naca_code"], n_points=200)
 
     geo_path = of_case_dir / "system" / "naca_airfoil.geo"
     msh_path = of_case_dir / "naca_airfoil.msh"

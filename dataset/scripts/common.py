@@ -38,7 +38,7 @@ C_MU = 0.09                 # k-omega SST closure constant
 
 ENVELOPE = {
     "aoa_min_deg": -5.0,
-    "aoa_max_deg": 15.0,
+    "aoa_max_deg": 5.0,
     "re_min": 1.0e5,
     "re_max": 5.0e5,
     "camber_pct_min": 0.0,

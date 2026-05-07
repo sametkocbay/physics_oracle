@@ -328,7 +328,7 @@ SIMPLE
     residualControl
     {{
         p               1e-4;
-        U               1e-5;
+        U               1e-4;
         "(k|omega)"     1e-5;
     }}
 }}
