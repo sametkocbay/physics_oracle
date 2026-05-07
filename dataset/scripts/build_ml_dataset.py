@@ -1,0 +1,153 @@
+"""build_ml_dataset.py — Assemble the ML-ready point-cloud dataset.
+
+For every converged case in dataset/cases/ it:
+  1. Loads cell-center coordinates from mesh.h5
+  2. Crops to the training bounding box
+  3. Assembles all required channels
+  4. Writes one .npz (or .h5) per case to ./ML_dataset/
+
+Bounding box (chord = 1, LE at x=0, TE at x=1):
+  x ∈ [-1.5, 3.5]   (1.5c in front of LE, 2.5c behind TE)
+  y ∈ [-1.5, 1.5]   (1.5c above and below)
+
+Output arrays per file (N = number of cells inside the bounding box):
+  x, y          (N,) float32  — cell-center coordinates
+  sdf           (N,) float32  — distance to nearest airfoil surface (≥ 0 outside)
+  u_init        (N,) float32  — inlet Ux (uniform initial condition)
+  v_init        (N,) float32  — inlet Uy (uniform initial condition)
+  u, v          (N,) float32  — solved velocity components
+  p             (N,) float32  — kinematic pressure
+  omega         (N,) float32  — specific dissipation rate
+  k             (N,) float32  — turbulent kinetic energy
+  nut           (N,) float32  — turbulent viscosity
+  reynolds      ()   float32  — Reynolds number (scalar)
+  is_wall       (N,) uint8    — 1 if cell is adjacent to airfoil wall, else 0
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import h5py
+import numpy as np
+import yaml
+
+# ---------------------------------------------------------------------------
+# Bounding box in chord-normalized coordinates
+# ---------------------------------------------------------------------------
+X_MIN = -1.5
+X_MAX = 3.5    # TE is at x=1, so 1 + 2.5 = 3.5
+Y_MIN = -1.5
+Y_MAX = 1.5
+
+
+def build_sample(case_dir: Path) -> dict | None:
+    meta_path = case_dir / "meta.yaml"
+    mesh_path = case_dir / "mesh.h5"
+    fields_path = case_dir / "fields.h5"
+
+    for p in (meta_path, mesh_path, fields_path):
+        if not p.exists():
+            return None
+
+    meta = yaml.safe_load(meta_path.read_text())
+    if not meta.get("converged", False):
+        return None
+
+    re = float(meta["Re"])
+    u_inlet = meta["U_inlet"]
+    ux_init = float(u_inlet[0])
+    vy_init = float(u_inlet[1])
+
+    with h5py.File(mesh_path, "r") as h:
+        cell_centers = h["cell_centers"][:]        # (N, 2)
+        boundary_markers = h["boundary_markers"][:]  # (N,) int8
+
+    x = cell_centers[:, 0]
+    y = cell_centers[:, 1]
+    mask = (x >= X_MIN) & (x <= X_MAX) & (y >= Y_MIN) & (y <= Y_MAX)
+    if not mask.any():
+        return None
+
+    with h5py.File(fields_path, "r") as h:
+        U = h["U"][:]                # (N, 2)
+        p_arr = h["p"][:].ravel()   # (N,)
+        k = h["k"][:].ravel()
+        omega = h["omega"][:].ravel()
+        nut = h["nut"][:].ravel()
+        sdf = h["wall_distance"][:].ravel()
+
+    n = int(mask.sum())
+    return {
+        "x":       x[mask].astype(np.float32),
+        "y":       y[mask].astype(np.float32),
+        "sdf":     sdf[mask].astype(np.float32),
+        "u_init":  np.full(n, ux_init, dtype=np.float32),
+        "v_init":  np.full(n, vy_init, dtype=np.float32),
+        "u":       U[mask, 0].astype(np.float32),
+        "v":       U[mask, 1].astype(np.float32),
+        "p":       p_arr[mask].astype(np.float32),
+        "omega":   omega[mask].astype(np.float32),
+        "k":       k[mask].astype(np.float32),
+        "nut":     nut[mask].astype(np.float32),
+        "reynolds": np.float32(re),
+        "is_wall": (boundary_markers[mask] == 1).astype(np.uint8),
+    }
+
+
+def write_npz(out_path: Path, sample: dict) -> None:
+    np.savez_compressed(out_path, **sample)
+
+
+def write_h5(out_path: Path, sample: dict) -> None:
+    with h5py.File(out_path, "w") as h:
+        for key, val in sample.items():
+            arr = np.asarray(val)
+            if arr.ndim == 0:
+                h.attrs[key] = float(arr)
+            else:
+                h.create_dataset(key, data=arr, compression="gzip", compression_opts=4)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Build ML-ready point-cloud dataset.")
+    p.add_argument("--cases-dir", type=Path,
+                   default=Path(__file__).resolve().parents[2] / "dataset" / "cases")
+    p.add_argument("--output-dir", type=Path,
+                   default=Path(__file__).resolve().parents[2] / "ML_dataset")
+    p.add_argument("--fmt", choices=["npz", "h5"], default="npz",
+                   help="Output format (default: npz)")
+    p.add_argument("--only-converged", action="store_true", default=True,
+                   help="Skip non-converged cases (default: True)")
+    args = p.parse_args()
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    n_ok = n_skip = 0
+    for case_dir in sorted(args.cases_dir.iterdir()):
+        if not case_dir.is_dir():
+            continue
+        case_id = case_dir.name
+        sample = build_sample(case_dir)
+        if sample is None:
+            print(f"[SKIP] {case_id}")
+            n_skip += 1
+            continue
+
+        ext = args.fmt
+        out_path = args.output_dir / f"{case_id}.{ext}"
+        if ext == "npz":
+            write_npz(out_path, sample)
+        else:
+            write_h5(out_path, sample)
+
+        n_pts = int(sample["x"].shape[0])
+        print(f"[OK]   {case_id} -> {out_path.name}  ({n_pts:,} points)")
+        n_ok += 1
+
+    print(f"\nDone: {n_ok} written, {n_skip} skipped")
+
+
+if __name__ == "__main__":
+    main()
