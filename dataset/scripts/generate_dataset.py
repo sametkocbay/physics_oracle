@@ -262,6 +262,9 @@ def write_meta(spec: CaseSpec, qc_result: dict, mesh_quality: dict | None,
 
 def run_case(spec: CaseSpec, args: argparse.Namespace, solver_hash: str) -> dict:
     LOG.info("=== %s (split=%s) ===", spec.case_id, spec.split)
+    if (spec.case_dir / "fields.h5").exists():
+        LOG.info("[%s] already complete, skipping", spec.case_id)
+        return {"accepted": True, "skipped": True}
     spec.case_dir.mkdir(parents=True, exist_ok=True)
     spec.of_case_dir.mkdir(parents=True, exist_ok=True)
 
@@ -305,6 +308,75 @@ def run_case(spec: CaseSpec, args: argparse.Namespace, solver_hash: str) -> dict
 
     write_meta(spec, qc_result, mesh_quality, solver_hash)
     return qc_result
+
+
+# ---------------------------------------------------------------------------
+# Fill-mode helpers
+# ---------------------------------------------------------------------------
+
+def get_existing_cases() -> tuple[set[str], set[str]]:
+    """Return (all_tried_ids, accepted_ids) by scanning CASES_DIR on disk."""
+    all_tried: set[str] = set()
+    accepted: set[str] = set()
+    if CASES_DIR.exists():
+        for d in CASES_DIR.iterdir():
+            if d.is_dir():
+                all_tried.add(d.name)
+                if (d / "fields.h5").exists():
+                    accepted.add(d.name)
+    return all_tried, accepted
+
+
+def get_split_case_ids() -> set[str]:
+    """Read every splits/*.txt and return the union of all case IDs."""
+    ids: set[str] = set()
+    if SPLITS_DIR.exists():
+        for f in SPLITS_DIR.glob("*.txt"):
+            for line in f.read_text().splitlines():
+                line = line.strip()
+                if line:
+                    ids.add(line)
+    return ids
+
+
+def append_to_splits(new_cases: list[CaseSpec]) -> None:
+    """Merge new cases into the existing split files (non-destructive)."""
+    SPLITS_DIR.mkdir(parents=True, exist_ok=True)
+    by_split: dict[str, set[str]] = {}
+    for f in SPLITS_DIR.glob("*.txt"):
+        content = f.read_text().strip()
+        by_split[f.stem] = set(content.splitlines()) if content else set()
+    for c in new_cases:
+        by_split.setdefault(c.split, set()).add(c.case_id)
+    for split_name, ids in by_split.items():
+        (SPLITS_DIR / f"{split_name}.txt").write_text("\n".join(sorted(ids)) + "\n")
+
+
+def sample_fill_cases(profiles: list[dict], splits: dict[str, list[str]],
+                      exclude_ids: set[str], n_needed: int,
+                      base_seed: int) -> list[CaseSpec]:
+    """Sample new cases that don't overlap with exclude_ids.
+
+    Samples in batches with increasing seeds until we have at least
+    2 * n_needed candidates, giving a buffer in case some get rejected.
+    """
+    new_cases: list[CaseSpec] = []
+    seen_new: set[str] = set()
+    seed_offset = 10_000
+    target_buffer = n_needed * 2
+
+    while len(new_cases) < target_buffer and seed_offset < 10_000_000:
+        batch = sample_cases(profiles, splits,
+                             n_cases=max(n_needed * 5, 100),
+                             seed=base_seed + seed_offset)
+        for c in batch:
+            if c.case_id not in exclude_ids and c.case_id not in seen_new:
+                new_cases.append(c)
+                seen_new.add(c.case_id)
+        seed_offset += 10_000
+
+    LOG.info("Sampled %d fill candidates (want %d accepted)", len(new_cases), n_needed)
+    return new_cases
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +431,61 @@ def parse_args() -> argparse.Namespace:
                    help="At the end, hash N accepted cases for the §9 repro checklist.")
     p.add_argument("--workers", type=int, default=1,
                    help="Number of cases to run in parallel (default: 1 = serial).")
+    p.add_argument("--fill", action="store_true",
+                   help="Fill mode: scan cases/ and splits/ to find already-run cases, "
+                        "then sample and run only new cases until --n-cases accepted "
+                        "cases exist in total. Splits files are updated in-place; the "
+                        "manifest is left untouched.")
     return p.parse_args()
+
+
+def _run_cases_parallel(all_cases: list[CaseSpec], args: argparse.Namespace,
+                         solver_hash: str) -> tuple[int, int]:
+    """Run cases with a process pool; return (n_accepted, n_rejected)."""
+    n_accepted = n_rejected = 0
+    LOG.info("Running %d cases with %d parallel workers", len(all_cases), args.workers)
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(run_case, spec, args, solver_hash): spec
+                   for spec in all_cases}
+        n_done = 0
+        for fut in as_completed(futures):
+            spec = futures[fut]
+            n_done += 1
+            try:
+                result = fut.result()
+            except Exception as exc:
+                LOG.error("[%s] worker raised: %s", spec.case_id, exc)
+                result = {"accepted": False}
+            if result.get("accepted"):
+                n_accepted += 1
+            else:
+                n_rejected += 1
+            LOG.info("Progress %d/%d — accepted %d  rejected %d  [%s]",
+                     n_done, len(all_cases), n_accepted, n_rejected, spec.case_id)
+    return n_accepted, n_rejected
+
+
+def _run_cases_serial(all_cases: list[CaseSpec], args: argparse.Namespace,
+                      solver_hash: str, stop_after_accepted: int | None = None
+                      ) -> tuple[int, int, list[CaseSpec]]:
+    """Run cases one by one; return (n_accepted, n_rejected, cases_run).
+
+    If stop_after_accepted is set, stops as soon as that many cases are accepted.
+    """
+    n_accepted = n_rejected = 0
+    cases_run: list[CaseSpec] = []
+    for i, spec in enumerate(all_cases, 1):
+        LOG.info("--- case %d / %d ---", i, len(all_cases))
+        result = run_case(spec, args, solver_hash)
+        cases_run.append(spec)
+        if result.get("accepted"):
+            n_accepted += 1
+        else:
+            n_rejected += 1
+        if stop_after_accepted is not None and n_accepted >= stop_after_accepted:
+            LOG.info("Reached %d accepted cases — stopping early.", n_accepted)
+            break
+    return n_accepted, n_rejected, cases_run
 
 
 def main() -> None:
@@ -374,6 +500,58 @@ def main() -> None:
     splits = assign_splits(profiles, seed=args.seed)
     LOG.info("Splits: train=%d val=%d test=%d", *(len(splits[k]) for k in ("train", "val", "test")))
 
+    solver_hash = solver_settings_hash()
+    t0 = time.time()
+
+    # ------------------------------------------------------------------
+    # Fill mode: top-up accepted cases to --n-cases without re-running
+    # anything that already has a case directory (tried or accepted).
+    # ------------------------------------------------------------------
+    if args.fill:
+        existing_tried, existing_accepted = get_existing_cases()
+        split_ids = get_split_case_ids()
+        exclude_ids = existing_tried | split_ids
+
+        n_accepted_existing = len(existing_accepted)
+        n_more_needed = args.n_cases - n_accepted_existing
+
+        LOG.info(
+            "Fill mode: %d accepted on disk, %d in splits, target %d → need %d more accepted",
+            n_accepted_existing, len(split_ids), args.n_cases, max(0, n_more_needed),
+        )
+
+        if n_more_needed <= 0:
+            LOG.info("Target already reached. Nothing to do.")
+            return
+
+        all_cases = sample_fill_cases(profiles, splits, exclude_ids,
+                                      n_more_needed, args.seed)
+
+        if args.workers > 1:
+            n_accepted, n_rejected = _run_cases_parallel(all_cases, args, solver_hash)
+            cases_run = all_cases
+        else:
+            n_accepted, n_rejected, cases_run = _run_cases_serial(
+                all_cases, args, solver_hash, stop_after_accepted=n_more_needed)
+
+        append_to_splits(cases_run)
+
+        dt_s = time.time() - t0
+        total_accepted = n_accepted_existing + n_accepted
+        LOG.info(
+            "Fill done: +%d accepted, +%d rejected in %.1f s  (total accepted: %d / %d)",
+            n_accepted, n_rejected, dt_s, total_accepted, args.n_cases,
+        )
+        if total_accepted < args.n_cases:
+            LOG.warning(
+                "Still %d short of target — re-run with --fill to sample more candidates.",
+                args.n_cases - total_accepted,
+            )
+        return
+
+    # ------------------------------------------------------------------
+    # Normal (fresh) mode
+    # ------------------------------------------------------------------
     LOG.info("§2.2  sampling %d in-domain cases", args.n_cases)
     cases = sample_cases(profiles, splits, n_cases=args.n_cases, seed=args.seed)
 
@@ -389,40 +567,10 @@ def main() -> None:
     write_splits(all_cases)
     write_manifest(profiles, splits, cases, ood_cases, args.seed, args)
 
-    solver_hash = solver_settings_hash()
-
-    n_accepted = 0
-    n_rejected = 0
-    t0 = time.time()
-
     if args.workers > 1:
-        LOG.info("Running %d cases with %d parallel workers", len(all_cases), args.workers)
-        with ProcessPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(run_case, spec, args, solver_hash): spec
-                       for spec in all_cases}
-            n_done = 0
-            for fut in as_completed(futures):
-                spec = futures[fut]
-                n_done += 1
-                try:
-                    result = fut.result()
-                except Exception as exc:
-                    LOG.error("[%s] worker raised: %s", spec.case_id, exc)
-                    result = {"accepted": False}
-                if result.get("accepted"):
-                    n_accepted += 1
-                else:
-                    n_rejected += 1
-                LOG.info("Progress %d/%d — accepted %d  rejected %d  [%s]",
-                         n_done, len(all_cases), n_accepted, n_rejected, spec.case_id)
+        n_accepted, n_rejected = _run_cases_parallel(all_cases, args, solver_hash)
     else:
-        for i, spec in enumerate(all_cases, 1):
-            LOG.info("--- case %d / %d ---", i, len(all_cases))
-            result = run_case(spec, args, solver_hash)
-            if result.get("accepted"):
-                n_accepted += 1
-            else:
-                n_rejected += 1
+        n_accepted, n_rejected, _ = _run_cases_serial(all_cases, args, solver_hash)
 
     dt_s = time.time() - t0
 
