@@ -16,7 +16,7 @@ from common import setup_logging
 
 LOG = setup_logging()
 
-OPENFOAM_BASHRC = "/opt/openfoam13/etc/bashrc"
+OPENFOAM_BASHRC = os.environ.get("OPENFOAM_BASHRC", "/opt/openfoam13/etc/bashrc")
 
 
 def run_simple_foam(of_case_dir: Path, log_path: Path | None = None,

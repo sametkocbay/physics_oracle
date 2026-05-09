@@ -328,7 +328,7 @@ def run_postprocess(of_case_dir: Path, func: str, timeout: int = 600) -> bool:
     """Run `foamPostProcess -func <func> -latestTime` (OF13 Foundation)."""
     cmd = (
         "set -e && "
-        "if [ -z \"${WM_PROJECT_DIR:-}\" ]; then source /opt/openfoam13/etc/bashrc; fi && "
+        f"if [ -z \"${{WM_PROJECT_DIR:-}}\" ]; then source {os.environ.get('OPENFOAM_BASHRC', '/opt/openfoam13/etc/bashrc')}; fi && "
         f"cd {of_case_dir.resolve()} && foamPostProcess -func {func} -latestTime"
     )
     log = of_case_dir / f"postProcess.{func}.log"
