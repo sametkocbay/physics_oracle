@@ -26,6 +26,7 @@ Output arrays per file (N = number of cells inside the bounding box):
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -40,6 +41,16 @@ X_MIN = -1.5
 X_MAX = 3.5    # TE is at x=1, so 1 + 2.5 = 3.5
 Y_MIN = -1.5
 Y_MAX = 1.5
+
+
+def _read_cl_cd(case_dir: Path) -> tuple[float, float]:
+    conv_path = case_dir / "convergence.h5"
+    if not conv_path.exists():
+        return float("nan"), float("nan")
+    with h5py.File(conv_path, "r") as h:
+        cl = float(h["cl_history"][-1]) if "cl_history" in h else float("nan")
+        cd = float(h["cd_history"][-1]) if "cd_history" in h else float("nan")
+    return cl, cd
 
 
 def build_sample(case_dir: Path) -> dict | None:
@@ -124,6 +135,7 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    csv_rows: list[dict] = []
     n_ok = n_skip = 0
     for case_dir in sorted(args.cases_dir.iterdir()):
         if not case_dir.is_dir():
@@ -142,9 +154,31 @@ def main() -> None:
         else:
             write_h5(out_path, sample)
 
+        meta = yaml.safe_load((case_dir / "meta.yaml").read_text())
+        cl, cd = _read_cl_cd(case_dir)
+        u_inlet = meta["U_inlet"]
+        csv_rows.append({
+            "case_id":        case_id,
+            "aoa_deg":        meta.get("aoa_deg", float("nan")),
+            "reynolds":       meta["Re"],
+            "u_inlet_x":      float(u_inlet[0]),
+            "u_inlet_y":      float(u_inlet[1]),
+            "u_mag":          meta.get("U_mag", float("nan")),
+            "cl":             cl,
+            "cd":             cd,
+        })
+
         n_pts = int(sample["x"].shape[0])
         print(f"[OK]   {case_id} -> {out_path.name}  ({n_pts:,} points)")
         n_ok += 1
+
+    csv_path = args.output_dir / "metadata.csv"
+    fieldnames = ["case_id", "aoa_deg", "reynolds", "u_inlet_x", "u_inlet_y", "u_mag", "cl", "cd"]
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+    print(f"Metadata CSV -> {csv_path}  ({len(csv_rows)} rows)")
 
     print(f"\nDone: {n_ok} written, {n_skip} skipped")
 
