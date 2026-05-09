@@ -24,20 +24,21 @@ def run_simple_foam(of_case_dir: Path, log_path: Path | None = None,
     """Run foamRun -solver incompressibleFluid in `of_case_dir`. Returns the exit code.
 
     OpenFOAM 13 replaced simpleFoam with foamRun -solver incompressibleFluid.
-    OF 13 needs its bashrc sourced; we wrap the call in a bash -lc.
+    OF 13 needs its bashrc sourced; we wrap the call in a plain bash -c (not -lc)
+    so that cluster login scripts do not reset PATH/LD_LIBRARY_PATH after sourcing.
     The log is written to simpleFoam.log for compatibility with the log parser.
     """
     log_path = log_path or (of_case_dir / "simpleFoam.log")
     cmd = (
         f"set -e && "
-        f"if [ -z \"${{WM_PROJECT_DIR:-}}\" ]; then source {OPENFOAM_BASHRC}; fi && "
+        f"source {OPENFOAM_BASHRC} && "
         f"cd {of_case_dir.resolve()} && foamRun -solver incompressibleFluid"
     )
     LOG.info("[%s] running foamRun (timeout %ds) — log %s",
              of_case_dir.name, timeout, log_path.name)
     with log_path.open("w") as f:
         proc = subprocess.run(
-            ["bash", "-lc", cmd],
+            ["bash", "-c", cmd],
             stdout=f, stderr=subprocess.STDOUT,
             timeout=timeout, check=False,
         )

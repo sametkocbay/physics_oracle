@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -25,6 +27,17 @@ from common import (
 )
 
 LOG = setup_logging()
+
+OPENFOAM_BASHRC = os.environ.get("OPENFOAM_BASHRC", "/opt/openfoam13/etc/bashrc")
+
+
+def _of_run(args: list, cwd: Path, timeout: int = 600) -> subprocess.CompletedProcess:
+    """Run an OpenFOAM command with the OF environment sourced."""
+    cmd = f"source {OPENFOAM_BASHRC} && " + " ".join(shlex.quote(str(a)) for a in args)
+    return subprocess.run(
+        ["bash", "-c", cmd],
+        cwd=cwd, capture_output=True, text=True, timeout=timeout,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -344,10 +357,7 @@ def merge_default_faces_to_airfoil_walls(of_case_dir: Path) -> None:
     dict_path = of_case_dir / "system" / "createPatchDict"
     dict_path.write_text(_CREATE_PATCH_DICT)
     try:
-        res = subprocess.run(
-            ["createPatch", "-overwrite"],
-            cwd=of_case_dir, capture_output=True, text=True, timeout=120,
-        )
+        res = _of_run(["createPatch", "-overwrite"], cwd=of_case_dir, timeout=120)
         (of_case_dir / "createPatch.log").write_text(res.stdout + res.stderr)
         if res.returncode != 0:
             raise RuntimeError(f"createPatch failed for {of_case_dir.parent.name}: "
@@ -437,10 +447,7 @@ def generate_mesh(of_case_dir: Path, case_id: str) -> dict:
         raise RuntimeError(f"gmsh failed for {case_id}: see gmsh.log")
 
     LOG.info("[%s] gmshToFoam %s", case_id, msh_path.name)
-    res = subprocess.run(
-        ["gmshToFoam", str(msh_path)],
-        cwd=of_case_dir, capture_output=True, text=True, timeout=600,
-    )
+    res = _of_run(["gmshToFoam", str(msh_path)], cwd=of_case_dir, timeout=600)
     (of_case_dir / "gmshToFoam.log").write_text(res.stdout + res.stderr)
     if res.returncode != 0:
         raise RuntimeError(f"gmshToFoam failed for {case_id}: see gmshToFoam.log")
@@ -450,10 +457,7 @@ def generate_mesh(of_case_dir: Path, case_id: str) -> dict:
     patch_boundary_file(of_case_dir / "constant" / "polyMesh" / "boundary")
 
     LOG.info("[%s] checkMesh", case_id)
-    res = subprocess.run(
-        ["checkMesh"],
-        cwd=of_case_dir, capture_output=True, text=True, timeout=600,
-    )
+    res = _of_run(["checkMesh"], cwd=of_case_dir, timeout=600)
     log_text = res.stdout + res.stderr
     (of_case_dir / "checkMesh.log").write_text(log_text)
     quality = parse_check_mesh(log_text)
