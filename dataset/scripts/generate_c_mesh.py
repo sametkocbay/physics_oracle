@@ -28,6 +28,8 @@ two separate outlet boundary faces.
 from __future__ import annotations
 
 import io
+import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -39,6 +41,17 @@ from common import CHORD, NU, parse_case_id, setup_logging
 from generate_mesh import parse_check_mesh, patch_boundary_file
 
 LOG = setup_logging()
+
+OPENFOAM_BASHRC = os.environ.get("OPENFOAM_BASHRC", "/opt/openfoam13/etc/bashrc")
+
+
+def _of_run(args: list, cwd: Path, timeout: int = 600) -> subprocess.CompletedProcess:
+    """Run an OpenFOAM command with the OF environment sourced."""
+    cmd = f"source {OPENFOAM_BASHRC} && " + " ".join(shlex.quote(str(a)) for a in args)
+    return subprocess.run(
+        ["bash", "-c", cmd],
+        cwd=cwd, capture_output=True, text=True, timeout=timeout,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -459,10 +472,7 @@ def generate_c_mesh(of_case_dir: Path, case_id: str) -> dict:
     write_gmsh_msh(nodes, n_airfoil, n_wake, msh_path)
 
     LOG.info("[%s] gmshToFoam %s", case_id, msh_path.name)
-    res = subprocess.run(
-        ["gmshToFoam", str(msh_path)],
-        cwd=of_case_dir, capture_output=True, text=True, timeout=600,
-    )
+    res = _of_run(["gmshToFoam", str(msh_path)], cwd=of_case_dir, timeout=600)
     (of_case_dir / "gmshToFoam.log").write_text(res.stdout + res.stderr)
     if res.returncode != 0:
         raise RuntimeError(f"gmshToFoam failed for {case_id}: see gmshToFoam.log")
@@ -471,10 +481,7 @@ def generate_c_mesh(of_case_dir: Path, case_id: str) -> dict:
     patch_boundary_file(of_case_dir / "constant" / "polyMesh" / "boundary")
 
     LOG.info("[%s] checkMesh", case_id)
-    res = subprocess.run(
-        ["checkMesh"],
-        cwd=of_case_dir, capture_output=True, text=True, timeout=600,
-    )
+    res = _of_run(["checkMesh"], cwd=of_case_dir, timeout=600)
     log_text = res.stdout + res.stderr
     (of_case_dir / "checkMesh.log").write_text(log_text)
     quality = parse_check_mesh(log_text)
