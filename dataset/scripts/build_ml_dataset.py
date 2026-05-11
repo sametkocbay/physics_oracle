@@ -77,7 +77,7 @@ def _read_cl_cd(case_dir: Path) -> tuple[float, float]:
     return cl, cd
 
 
-def build_sample(case_dir: Path) -> tuple[dict, str] | None:
+def build_sample(case_dir: Path, crop: bool = True) -> tuple[dict, str] | None:
     """Return (sample_arrays, split_name) or None if the case should be skipped."""
     meta_path = case_dir / "meta.yaml"
     mesh_path = case_dir / "mesh.h5"
@@ -105,9 +105,12 @@ def build_sample(case_dir: Path) -> tuple[dict, str] | None:
 
     x = cell_centers[:, 0]
     y = cell_centers[:, 1]
-    mask = (x >= X_MIN) & (x <= X_MAX) & (y >= Y_MIN) & (y <= Y_MAX)
-    if not mask.any():
-        return None
+    if crop:
+        mask = (x >= X_MIN) & (x <= X_MAX) & (y >= Y_MIN) & (y <= Y_MAX)
+        if not mask.any():
+            return None
+    else:
+        mask = np.ones(len(x), dtype=bool)
 
     with h5py.File(fields_path, "r") as h:
         U = h["U"][:]
@@ -164,17 +167,30 @@ def main() -> None:
                    default=Path(__file__).resolve().parents[2] / "ML_dataset")
     p.add_argument("--fmt", choices=["npz", "h5"], default="npz",
                    help="Output format (default: npz)")
+    p.add_argument("--no-crop", action="store_true",
+                   help="Skip bounding-box crop — export all mesh cells")
+    p.add_argument("--file", metavar="CASE_ID",
+                   help="Process a single case by name (e.g. NACA0012_p3.0_2.5e5)")
     args = p.parse_args()
+
+    crop = not args.no_crop
 
     # csv_rows_by_split[split] = list of row dicts
     csv_rows_by_split: dict[str, list[dict]] = defaultdict(list)
     n_ok = n_skip = 0
 
-    for case_dir in sorted(args.cases_dir.iterdir()):
+    if args.file:
+        candidates = [args.cases_dir / args.file]
+    else:
+        candidates = sorted(args.cases_dir.iterdir())
+
+    for case_dir in candidates:
         if not case_dir.is_dir():
+            print(f"[ERROR] Not a directory: {case_dir}")
+            n_skip += 1
             continue
         case_id = case_dir.name
-        result = build_sample(case_dir)
+        result = build_sample(case_dir, crop=crop)
         if result is None:
             print(f"[SKIP] {case_id}")
             n_skip += 1
