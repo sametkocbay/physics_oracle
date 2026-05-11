@@ -77,7 +77,7 @@ def _read_cl_cd(case_dir: Path) -> tuple[float, float]:
     return cl, cd
 
 
-def build_sample(case_dir: Path, crop: bool = True) -> tuple[dict, str] | None:
+def build_sample(case_dir: Path, crop: bool = True, dtype: np.dtype = np.float32) -> tuple[dict, str] | None:
     """Return (sample_arrays, split_name) or None if the case should be skipped."""
     meta_path = case_dir / "meta.yaml"
     mesh_path = case_dir / "mesh.h5"
@@ -124,22 +124,22 @@ def build_sample(case_dir: Path, crop: bool = True) -> tuple[dict, str] | None:
 
     n = int(mask.sum())
     sample = {
-        "x":             x[mask].astype(np.float32),
-        "y":             y[mask].astype(np.float32),
-        "sdf":           sdf[mask].astype(np.float32),
-        "u_init":        np.full(n, ux_init, dtype=np.float32),
-        "v_init":        np.full(n, vy_init, dtype=np.float32),
-        "u":             U[mask, 0].astype(np.float32),
-        "v":             U[mask, 1].astype(np.float32),
-        "p":             p_arr[mask].astype(np.float32),
-        "omega":         omega[mask].astype(np.float32),
-        "k":             k[mask].astype(np.float32),
-        "nut":           nut[mask].astype(np.float32),
-        "reynolds":      np.float32(re),
-        "angle_of_attack": np.float32(aoa),
+        "x":             x[mask].astype(dtype),
+        "y":             y[mask].astype(dtype),
+        "sdf":           sdf[mask].astype(dtype),
+        "u_init":        np.full(n, ux_init, dtype=dtype),
+        "v_init":        np.full(n, vy_init, dtype=dtype),
+        "u":             U[mask, 0].astype(dtype),
+        "v":             U[mask, 1].astype(dtype),
+        "p":             p_arr[mask].astype(dtype),
+        "omega":         omega[mask].astype(dtype),
+        "k":             k[mask].astype(dtype),
+        "nut":           nut[mask].astype(dtype),
+        "reynolds":      dtype(re),
+        "angle_of_attack": dtype(aoa),
         "naca_code":     np.array(naca),
-        "cl":            np.float32(cl),
-        "cd":            np.float32(cd),
+        "cl":            dtype(cl),
+        "cd":            dtype(cd),
         "is_wall":       (boundary_markers[mask] == 1).astype(np.uint8),
     }
     return sample, split
@@ -169,11 +169,14 @@ def main() -> None:
                    help="Output format (default: npz)")
     p.add_argument("--no-crop", action="store_true",
                    help="Skip bounding-box crop — export all mesh cells")
+    p.add_argument("--double", action="store_true",
+                   help="Save arrays as float64 instead of float32")
     p.add_argument("--file", metavar="CASE_ID",
                    help="Process a single case by name (e.g. NACA0012_p3.0_2.5e5)")
     args = p.parse_args()
 
     crop = not args.no_crop
+    dtype = np.float64 if args.double else np.float32
 
     # csv_rows_by_split[split] = list of row dicts
     csv_rows_by_split: dict[str, list[dict]] = defaultdict(list)
@@ -190,7 +193,7 @@ def main() -> None:
             n_skip += 1
             continue
         case_id = case_dir.name
-        result = build_sample(case_dir, crop=crop)
+        result = build_sample(case_dir, crop=crop, dtype=dtype)
         if result is None:
             print(f"[SKIP] {case_id}")
             n_skip += 1
