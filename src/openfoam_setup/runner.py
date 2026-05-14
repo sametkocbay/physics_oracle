@@ -12,7 +12,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from common import setup_logging
+from core.logging import setup_logging
 
 LOG = setup_logging()
 

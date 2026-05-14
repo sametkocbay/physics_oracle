@@ -1,0 +1,294 @@
+# OpenFOAM dataset configuration — source of truth for solver setup.
+#
+# Per-case values are substituted at render time by
+# src/openfoam_setup/case_setup.py before the structure is fed to
+# src/openfoam_setup/of_writer.py.  Sentinel strings (uppercase keys
+# under `placeholders:` below) document which values are case-dependent.
+
+placeholders:
+  # Replaced per-case in case_setup.py:
+  #   U_X, U_Y         — inlet velocity components
+  #   U_MAG            — inlet velocity magnitude
+  #   K                — inlet turbulent kinetic energy
+  #   OMEGA            — inlet specific dissipation
+  #   LIFT_X, LIFT_Y   — lift unit vector (depends on AoA)
+  #   DRAG_X, DRAG_Y   — drag unit vector (depends on AoA)
+  #   END_TIME         — simpleFOAM end-time / max iterations
+  #   WRITE_INTERVAL   — controlDict writeInterval
+  #   NU               — kinematic viscosity (physical.nu)
+
+physical:
+  nu: 1.0e-5
+  chord: 1.0
+
+turbulence:
+  intensity: 0.01            # I, §5.3 k formula
+  length_fraction: 0.07      # L = frac * chord, §5.3 omega formula
+  c_mu: 0.09                 # k-omega SST closure constant
+  model: kOmegaSST
+
+momentum_transport:
+  simulationType: RAS
+  RAS:
+    model: kOmegaSST
+    turbulence: 'on'
+    printCoeffs: 'on'
+
+control_dict:
+  application: foamRun
+  solver: incompressibleFluid
+  startFrom: startTime
+  startTime: 0
+  stopAt: endTime
+  endTime: __END_TIME__
+  deltaT: 1
+  writeControl: timeStep
+  writeInterval: __WRITE_INTERVAL__
+  purgeWrite: 1
+  writeFormat: ascii
+  writePrecision: 12
+  writeCompression: 'off'
+  timeFormat: general
+  timePrecision: 6
+  runTimeModifiable: 'true'
+  functions:
+    forceCoeffs1:
+      type: forceCoeffs
+      libs: ['"libforces.so"']
+      writeControl: timeStep
+      writeInterval: 1
+      patches: [airfoilWalls]
+      rho: rhoInf
+      rhoInf: 1
+      liftDir: "(__LIFT_X__ __LIFT_Y__ 0)"
+      dragDir: "(__DRAG_X__ __DRAG_Y__ 0)"
+      CofR: "(0.25 0 0)"
+      pitchAxis: "(0 0 1)"
+      magUInf: __U_MAG__
+      lRef: 1.0
+      Aref: 1.0
+    residuals:
+      type: residuals
+      libs: ['"libutilityFunctionObjects.so"']
+      writeControl: timeStep
+      writeInterval: 1
+      fields: [U, p, k, omega]
+    yPlus:
+      type: yPlus
+      libs: ['"libfieldFunctionObjects.so"']
+      writeControl: writeTime
+      patches: [airfoilWalls]
+    writePhi:
+      type: writeObjects
+      libs: ['"libutilityFunctionObjects.so"']
+      writeControl: writeTime
+      writeOption: anyWrite
+      objects: [phi]
+
+fv_schemes:
+  ddtSchemes:
+    default: steadyState
+  gradSchemes:
+    default: Gauss linear
+    grad(U): cellLimited Gauss linear 1
+    grad(p): Gauss linear
+  divSchemes:
+    default: none
+    div(phi,U): bounded Gauss linearUpwindV grad(U)
+    div(phi,k): bounded Gauss upwind
+    div(phi,omega): bounded Gauss upwind
+    div((nuEff*dev2(T(grad(U))))): Gauss linear
+    div((nuEff*dev(T(grad(U))))): Gauss linear
+  laplacianSchemes:
+    default: Gauss linear corrected
+  interpolationSchemes:
+    default: linear
+  snGradSchemes:
+    default: corrected
+  fluxRequired:
+    default: 'no'
+    p: ~
+    phi: ~
+  wallDist:
+    method: meshWave
+
+fv_solution:
+  solvers:
+    p:
+      solver: GAMG
+      tolerance: 1.0e-7
+      relTol: 0.01
+      smoother: DICGaussSeidel
+      cacheAgglomeration: 'true'
+      agglomerator: faceAreaPair
+      nCellsInCoarsestLevel: 10
+      mergeLevels: 1
+    '"(U|k|omega)"':
+      solver: smoothSolver
+      smoother: symGaussSeidel
+      tolerance: 1.0e-8
+      relTol: 0.1
+  SIMPLE:
+    nNonOrthogonalCorrectors: 2
+    consistent: 'yes'
+    residualControl:
+      p: 1.0e-4
+      U: 1.0e-4
+      '"(k|omega)"': 1.0e-5
+  relaxationFactors:
+    fields:
+      p: 0.3
+    equations:
+      U: 0.7
+      '"(k|omega)"': 0.7
+  cache:
+    grad(U): ~
+
+# Boundary conditions, per field, per patch.  case_setup.py substitutes the
+# __U_X__/__U_Y__/__K__/__OMEGA__ sentinels with per-case numerics before
+# rendering.  __inline_children__ tells the OF writer to render each child
+# dict as a single line inside the parent block.
+boundary_conditions:
+  U:
+    dimensions: '[0 1 -1 0 0 0 0]'
+    internalField: "uniform (__U_X__ __U_Y__ 0)"
+    boundaryField:
+      __inline_children__: true
+      inlet:
+        type: fixedValue
+        value: "uniform (__U_X__ __U_Y__ 0)"
+      outlet:
+        type: zeroGradient
+      top:
+        type: freestream
+        freestreamValue: "uniform (__U_X__ __U_Y__ 0)"
+      bottom:
+        type: freestream
+        freestreamValue: "uniform (__U_X__ __U_Y__ 0)"
+      airfoilWalls:
+        type: noSlip
+      frontAndBack:
+        type: empty
+
+  p:
+    dimensions: '[0 2 -2 0 0 0 0]'
+    internalField: "uniform 0"
+    boundaryField:
+      __inline_children__: true
+      inlet:
+        type: zeroGradient
+      outlet:
+        type: fixedValue
+        value: "uniform 0"
+      top:
+        type: freestream
+        freestreamValue: "uniform 0"
+      bottom:
+        type: freestream
+        freestreamValue: "uniform 0"
+      airfoilWalls:
+        type: zeroGradient
+      frontAndBack:
+        type: empty
+
+  k:
+    dimensions: '[0 2 -2 0 0 0 0]'
+    internalField: "uniform __K__"
+    boundaryField:
+      __inline_children__: true
+      inlet:
+        type: fixedValue
+        value: "uniform __K__"
+      outlet:
+        type: zeroGradient
+      top:
+        type: inletOutlet
+        inletValue: "uniform __K__"
+        value: "uniform __K__"
+      bottom:
+        type: inletOutlet
+        inletValue: "uniform __K__"
+        value: "uniform __K__"
+      airfoilWalls:
+        type: fixedValue
+        value: "uniform 0"
+      frontAndBack:
+        type: empty
+
+  omega:
+    dimensions: '[0 0 -1 0 0 0 0]'
+    internalField: "uniform __OMEGA__"
+    boundaryField:
+      __inline_children__: true
+      inlet:
+        type: fixedValue
+        value: "uniform __OMEGA__"
+      outlet:
+        type: zeroGradient
+      top:
+        type: inletOutlet
+        inletValue: "uniform __OMEGA__"
+        value: "uniform __OMEGA__"
+      bottom:
+        type: inletOutlet
+        inletValue: "uniform __OMEGA__"
+        value: "uniform __OMEGA__"
+      airfoilWalls:
+        type: omegaWallFunction
+        value: "uniform __OMEGA__"
+      frontAndBack:
+        type: empty
+
+  nut:
+    dimensions: '[0 2 -1 0 0 0 0]'
+    internalField: "uniform 0"
+    boundaryField:
+      __inline_children__: true
+      inlet:
+        type: calculated
+        value: "uniform 0"
+      outlet:
+        type: calculated
+        value: "uniform 0"
+      top:
+        type: calculated
+        value: "uniform 0"
+      bottom:
+        type: calculated
+        value: "uniform 0"
+      airfoilWalls:
+        type: nutLowReWallFunction
+        value: "uniform 0"
+      frontAndBack:
+        type: empty
+
+  phi:
+    dimensions: '[0 3 -1 0 0 0 0]'
+    internalField: "uniform 0"
+    boundaryField:
+      __inline_children__: true
+      inlet:
+        type: calculated
+        value: "uniform 0"
+      outlet:
+        type: calculated
+        value: "uniform 0"
+      top:
+        type: calculated
+        value: "uniform 0"
+      bottom:
+        type: calculated
+        value: "uniform 0"
+      airfoilWalls:
+        type: calculated
+        value: "uniform 0"
+      frontAndBack:
+        type: empty
+
+field_classes:
+  U: volVectorField
+  p: volScalarField
+  k: volScalarField
+  omega: volScalarField
+  nut: volScalarField
+  phi: surfaceScalarField

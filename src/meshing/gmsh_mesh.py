@@ -18,13 +18,10 @@ from pathlib import Path
 
 import numpy as np
 
-from common import (
-    CHORD,
-    NU,
-    naca4_coordinates,
-    parse_case_id,
-    setup_logging,
-)
+from core.case_spec import parse_case_id
+from core.envelope import CHORD, NU
+from core.logging import setup_logging
+from geometry.naca import naca4_coordinates
 
 LOG = setup_logging()
 

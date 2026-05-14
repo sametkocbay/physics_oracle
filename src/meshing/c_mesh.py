@@ -37,8 +37,10 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import brentq
 
-from common import CHORD, NU, parse_case_id, setup_logging
-from generate_mesh import parse_check_mesh, patch_boundary_file
+from core.case_spec import parse_case_id
+from core.envelope import CHORD, NU
+from core.logging import setup_logging
+from meshing.gmsh_mesh import parse_check_mesh, patch_boundary_file
 
 LOG = setup_logging()
 

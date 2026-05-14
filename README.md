@@ -259,22 +259,25 @@ N ≈ 220 000 points per case (after bounding-box crop from ~281 000 total cells
 ### 8.3 Usage
 
 ```bash
-# Default: .npz output to ./ML_dataset/
-python dataset/scripts/build_ml_dataset.py
+# Default: .npz output to dataset/ML_dataset/
+uv run python scripts/build_ml_dataset.py
 
 # HDF5 output
-python dataset/scripts/build_ml_dataset.py --fmt h5
+uv run python scripts/build_ml_dataset.py --fmt h5
 
 # Custom paths
-python dataset/scripts/build_ml_dataset.py \
+uv run python scripts/build_ml_dataset.py \
     --cases-dir dataset/cases \
-    --output-dir ML_dataset
+    --output-dir dataset/ML_dataset
 ```
+
+The crop box, exported fields, output format, and dtype are configured in
+`configs/postprocess.yaml`.
 
 Loading a sample in Python:
 ```python
 import numpy as np
-data = np.load("ML_dataset/NACA2412_p5.0_3.0e5.npz")
+data = np.load("dataset/ML_dataset/train/NACA2412_p5.0_3.0e5.npz")
 # data['x'], data['u'], data['sdf'], data['reynolds'], ...
 ```
 
@@ -282,22 +285,30 @@ data = np.load("ML_dataset/NACA2412_p5.0_3.0e5.npz")
 
 ## 9. Running the Full Pipeline
 
+Install dependencies once with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv sync
+```
+
+Then run the orchestrator:
+
 ```bash
 # Full run: 50 profiles, 200 cases, 10 OOD
-python dataset/scripts/generate_dataset.py \
+uv run python scripts/generate_dataset.py \
     --n-profiles 50 --n-cases 200 --n-ood 10 --seed 0
 
 # Manifest + splits only (no meshing/solving)
-python dataset/scripts/generate_dataset.py \
+uv run python scripts/generate_dataset.py \
     --n-profiles 50 --n-cases 200 --skip-of
 
 # Run specific cases
-python dataset/scripts/generate_dataset.py \
+uv run python scripts/generate_dataset.py \
     --n-profiles 50 --n-cases 200 \
     --cases NACA2412_p5.0_3.0e5 NACA0012_p0.0_2.0e5
 
 # After cases are done, build the ML dataset
-python dataset/scripts/build_ml_dataset.py
+uv run python scripts/build_ml_dataset.py
 ```
 
 ---
@@ -306,39 +317,37 @@ python dataset/scripts/build_ml_dataset.py
 
 ```
 cfd_data_generator/
-├── ML_dataset/                             # flat ML-ready point clouds (one .npz per case)
-│   ├── NACA2412_p5.0_3.0e5.npz
-│   └── ...
-├── dataset/
-│   ├── manifest.yaml                       # dataset-level metadata, seeds, envelope
-│   ├── rejection_log.csv                   # QC rejections: case_id, reason, timestamp
-│   ├── splits/
-│   │   ├── train.txt
-│   │   ├── val.txt
-│   │   ├── test.txt
-│   │   └── ood_probe.txt
-│   ├── cases/
-│   │   └── NACA2412_p5.0_3.0e5/
-│   │       ├── meta.yaml
-│   │       ├── fields.h5
-│   │       ├── mesh.h5
-│   │       ├── geometry.h5
-│   │       ├── convergence.h5
-│   │       └── of_case/
-│   │           ├── 0/           (U, p, k, omega, nut)
-│   │           ├── constant/    (polyMesh/, momentumTransport, physicalProperties)
-│   │           └── system/      (controlDict, fvSchemes, fvSolution)
-│   └── scripts/
-│       ├── generate_dataset.py             # main orchestrator — runs the full pipeline
-│       ├── generate_geometry.py            # NACA LHS profile sampling
-│       ├── generate_mesh.py                # Gmsh C-grid mesh generation
-│       ├── setup_openfoam_case.py          # writes 0/, constant/, system/ from templates
-│       ├── run_openfoam.py                 # runs simpleFoam, parses residual log
-│       ├── extract_fields.py               # OF output → fields.h5, mesh.h5, geometry.h5, convergence.h5
-│       ├── quality_check.py                # QC checks, writes rejection_log.csv
-│       ├── build_ml_dataset.py             # crops + exports ML_dataset/*.npz
-│       └── common.py                       # shared constants, NACA geometry, case naming
-└── prototype/                              # exploratory notebooks / scratch work
+├── pyproject.toml                      # uv / hatchling — declares the four src/ packages
+├── uv.lock
+├── configs/
+│   ├── openfoam.yaml                   # solver + BC + turbulence (source of truth)
+│   └── postprocess.yaml                # ML crop box, fields, QC thresholds, viz panels
+├── src/
+│   ├── core/                           # CaseSpec, paths, envelope, logging, repro
+│   ├── geometry/                       # NACA math + LHS sampling
+│   ├── meshing/                        # Gmsh unstructured + structured C-mesh
+│   └── openfoam_setup/                 # case_setup + of_writer, runner, extract, qc
+├── scripts/
+│   ├── generate_dataset.py             # main orchestrator — runs the full pipeline
+│   └── build_ml_dataset.py             # crops + exports ML_dataset/*.npz
+├── utils/
+│   └── visualize_npz.py                # 2x2 panel renderer for ML_dataset samples
+└── dataset/                            # runtime outputs (gitignored)
+    ├── manifest.yaml                   # dataset-level metadata, seeds, envelope
+    ├── rejection_log.csv               # QC rejections: case_id, reason, timestamp
+    ├── splits/                         # train.txt, val.txt, test.txt, ood_probe.txt
+    ├── cases/<case_id>/
+    │   ├── meta.yaml
+    │   ├── fields.h5
+    │   ├── mesh.h5
+    │   ├── geometry.h5
+    │   ├── convergence.h5
+    │   └── of_case/                    # 0/, constant/, system/
+    └── ML_dataset/                     # per-split subfolders with .npz + metadata.csv
+        ├── train/
+        ├── val/
+        ├── test/
+        └── ood/                        (if any ood cases exist)
 ```
 
 ---
@@ -346,9 +355,10 @@ cfd_data_generator/
 ## 11. Reproducibility Checklist
 
 - [ ] OpenFOAM v13 Foundation installed and sourced (`/opt/openfoam13/etc/bashrc`)
+- [ ] `uv sync` ran cleanly; `.venv/` matches `uv.lock`
 - [ ] `manifest.yaml` records `openfoam_version`, `mesh_version`, all LHS seeds
 - [ ] Mesh generation is deterministic: same NACA code → byte-identical mesh
-- [ ] `solver_settings_hash` (md5 of fvSchemes + fvSolution) is identical across all cases
+- [ ] `solver_settings_hash` (md5 of `configs/openfoam.yaml`) is identical across all cases
 - [ ] Split lists in `splits/` are committed — no random re-splitting at load time
 - [ ] At least 5 cases re-run end-to-end and produce identical `fields.h5` (use `repro_hashes.json`)
 - [ ] `rejection_log.csv` preserved and non-empty after any full run

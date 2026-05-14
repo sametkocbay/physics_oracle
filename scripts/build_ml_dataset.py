@@ -2,45 +2,16 @@
 
 For every converged case in dataset/cases/ it:
   1. Loads cell-center coordinates from mesh.h5
-  2. Crops to the training bounding box
+  2. Crops to the bounding box configured in configs/postprocess.yaml
   3. Assembles all required channels
   4. Writes one .npz (or .h5) per case into the appropriate split subfolder
 
 Output folder structure (HuggingFace-compatible):
-  ML_dataset/
-  ├── train/
-  │   ├── <case_id>.npz
-  │   └── metadata.csv
-  ├── val/
-  │   ├── <case_id>.npz
-  │   └── metadata.csv
-  ├── test/
-  │   ├── <case_id>.npz
-  │   └── metadata.csv
-  └── ood/          (if any ood cases exist)
-      ├── <case_id>.npz
-      └── metadata.csv
-
-Bounding box (chord = 1, LE at x=0, TE at x=1):
-  x ∈ [-1.5, 3.5]   (1.5c in front of LE, 2.5c behind TE)
-  y ∈ [-1.5, 1.5]   (1.5c above and below)
-
-Output arrays per file (N = number of cells inside the bounding box):
-  x, y             (N,) float32  — cell-center coordinates
-  sdf              (N,) float32  — distance to nearest airfoil surface (≥ 0 outside)
-  u_init           (N,) float32  — inlet Ux (uniform initial condition)
-  v_init           (N,) float32  — inlet Uy (uniform initial condition)
-  u, v             (N,) float32  — solved velocity components
-  p                (N,) float32  — kinematic pressure
-  omega            (N,) float32  — specific dissipation rate
-  k                (N,) float32  — turbulent kinetic energy
-  nut              (N,) float32  — turbulent viscosity
-  reynolds         ()   float32  — Reynolds number (scalar)
-  angle_of_attack  ()   float32  — angle of attack in degrees (scalar)
-  naca_code        ()   str      — NACA 4-digit code (scalar)
-  cl               ()   float32  — lift coefficient (scalar)
-  cd               ()   float32  — drag coefficient (scalar)
-  is_wall          (N,) uint8    — 1 if cell is adjacent to airfoil wall, else 0
+  dataset/ML_dataset/
+  ├── train/<case_id>.npz + metadata.csv
+  ├── val/  <case_id>.npz + metadata.csv
+  ├── test/ <case_id>.npz + metadata.csv
+  └── ood/  <case_id>.npz + metadata.csv  (if any ood cases exist)
 """
 from __future__ import annotations
 
@@ -53,18 +24,11 @@ import h5py
 import numpy as np
 import yaml
 
-# ---------------------------------------------------------------------------
-# Bounding box in chord-normalized coordinates
-# ---------------------------------------------------------------------------
-X_MIN = -1.5
-X_MAX = 3.5    # TE is at x=1, so 1 + 2.5 = 3.5
-Y_MIN = -1.5
-Y_MAX = 1.5
+from core.paths import CASES_DIR, ML_DATASET_DIR, POSTPROCESS_CONFIG_PATH
 
-CSV_FIELDNAMES = [
-    "file_name", "case_id", "naca_code", "aoa_deg", "reynolds",
-    "u_inlet_x", "u_inlet_y", "u_mag", "cl", "cd",
-]
+
+def _load_config() -> dict:
+    return yaml.safe_load(POSTPROCESS_CONFIG_PATH.read_text())
 
 
 def _read_cl_cd(case_dir: Path) -> tuple[float, float]:
@@ -77,7 +41,7 @@ def _read_cl_cd(case_dir: Path) -> tuple[float, float]:
     return cl, cd
 
 
-def build_sample(case_dir: Path, crop: bool = True, dtype: np.dtype = np.float32) -> tuple[dict, str] | None:
+def build_sample(case_dir: Path, bbox: dict, crop: bool, dtype: np.dtype):
     """Return (sample_arrays, split_name) or None if the case should be skipped."""
     meta_path = case_dir / "meta.yaml"
     mesh_path = case_dir / "mesh.h5"
@@ -105,8 +69,10 @@ def build_sample(case_dir: Path, crop: bool = True, dtype: np.dtype = np.float32
 
     x = cell_centers[:, 0]
     y = cell_centers[:, 1]
+    x_min, x_max = bbox["x"]
+    y_min, y_max = bbox["y"]
     if crop:
-        mask = (x >= X_MIN) & (x <= X_MAX) & (y >= Y_MIN) & (y <= Y_MAX)
+        mask = (x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max)
         if not mask.any():
             return None
     else:
@@ -160,13 +126,17 @@ def write_h5(out_path: Path, sample: dict) -> None:
 
 
 def main() -> None:
+    cfg = _load_config()
+    ml = cfg["ml_dataset"]
+    csv_columns = ml["metadata_csv"]["columns"]
+    default_fmt = ml.get("output_format", "npz")
+    default_dtype = ml.get("dtype", "float32")
+    default_crop = bool(ml.get("crop", True))
+
     p = argparse.ArgumentParser(description="Build ML-ready point-cloud dataset.")
-    p.add_argument("--cases-dir", type=Path,
-                   default=Path(__file__).resolve().parents[2] / "dataset" / "cases")
-    p.add_argument("--output-dir", type=Path,
-                   default=Path(__file__).resolve().parents[2] / "ML_dataset")
-    p.add_argument("--fmt", choices=["npz", "h5"], default="npz",
-                   help="Output format (default: npz)")
+    p.add_argument("--cases-dir", type=Path, default=CASES_DIR)
+    p.add_argument("--output-dir", type=Path, default=ML_DATASET_DIR)
+    p.add_argument("--fmt", choices=["npz", "h5"], default=default_fmt)
     p.add_argument("--no-crop", action="store_true",
                    help="Skip bounding-box crop — export all mesh cells")
     p.add_argument("--double", action="store_true",
@@ -175,10 +145,10 @@ def main() -> None:
                    help="Process a single case by name (e.g. NACA0012_p3.0_2.5e5)")
     args = p.parse_args()
 
-    crop = not args.no_crop
-    dtype = np.float64 if args.double else np.float32
+    bbox = ml["bounding_box"]
+    crop = default_crop and not args.no_crop
+    dtype = np.float64 if (args.double or default_dtype == "float64") else np.float32
 
-    # csv_rows_by_split[split] = list of row dicts
     csv_rows_by_split: dict[str, list[dict]] = defaultdict(list)
     n_ok = n_skip = 0
 
@@ -193,7 +163,7 @@ def main() -> None:
             n_skip += 1
             continue
         case_id = case_dir.name
-        result = build_sample(case_dir, crop=crop, dtype=dtype)
+        result = build_sample(case_dir, bbox=bbox, crop=crop, dtype=dtype)
         if result is None:
             print(f"[SKIP] {case_id}")
             n_skip += 1
@@ -232,7 +202,7 @@ def main() -> None:
     for split, rows in csv_rows_by_split.items():
         csv_path = args.output_dir / split / "metadata.csv"
         with csv_path.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+            writer = csv.DictWriter(f, fieldnames=csv_columns)
             writer.writeheader()
             writer.writerows(rows)
         print(f"Metadata CSV -> {csv_path}  ({len(rows)} rows)")

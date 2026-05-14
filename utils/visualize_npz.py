@@ -3,36 +3,53 @@
 Loads one or more .npz files produced by build_ml_dataset.py, interpolates
 u, v, p, and sdf onto a regular grid, and saves a 2×2 panel PNG.
 
+Bounding box, panel list, and SDF threshold are read from
+configs/postprocess.yaml so the visualization stays consistent with the
+ML dataset.
+
 Usage:
-    python utils/visualize_npz.py ML_dataset/NACA2412_p5.0_3.0e5.npz
-    python utils/visualize_npz.py ML_dataset/*.npz --out plots/
-    python utils/visualize_npz.py ML_dataset/NACA2412_p5.0_3.0e5.npz --resolution 800
+    uv run python utils/visualize_npz.py dataset/ML_dataset/train/NACA2412_p5.0_3.0e5.npz
+    uv run python utils/visualize_npz.py dataset/ML_dataset/train/*.npz --out plots/
 """
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import yaml
 from scipy.interpolate import LinearNDInterpolator
 
-# Must match the bounding box in build_ml_dataset.py
-X_MIN, X_MAX = -1.5, 3.5
-Y_MIN, Y_MAX = -1.5, 1.5
+from core.paths import POSTPROCESS_CONFIG_PATH
 
-# (dataset key, panel title, colormap, is_diverging)
-PANELS = [
-    ("u",   r"$u$ (velocity x)",      "RdBu_r",  True),
-    ("v",   r"$v$ (velocity y)",      "RdBu_r",  True),
-    ("p",   r"$p$ (pressure)",        "coolwarm", True),
-    ("sdf", r"SDF (wall distance)",   "viridis",  False),
-]
 
-# SDF threshold below which cells are considered inside/on the airfoil
-_WALL_SDF = 0.005
+@lru_cache(maxsize=1)
+def _postprocess_config() -> dict:
+    return yaml.safe_load(POSTPROCESS_CONFIG_PATH.read_text())
+
+
+def _bbox() -> tuple[float, float, float, float]:
+    bb = _postprocess_config()["ml_dataset"]["bounding_box"]
+    return bb["x"][0], bb["x"][1], bb["y"][0], bb["y"][1]
+
+
+def _panels() -> list[tuple[str, str, str, bool]]:
+    vis = _postprocess_config()["visualize"]
+    return [(p["key"], p["title"], p["cmap"], bool(p["diverging"]))
+            for p in vis["panels"]]
+
+
+def _wall_sdf_threshold() -> float:
+    return float(_postprocess_config()["visualize"]["wall_sdf_threshold"])
+
+
+X_MIN, X_MAX, Y_MIN, Y_MAX = _bbox()
+PANELS = _panels()
+_WALL_SDF = _wall_sdf_threshold()
 
 
 def _color_limits(data: np.ndarray, diverging: bool, center: float) -> tuple[float, float]:

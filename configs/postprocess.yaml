@@ -1,0 +1,40 @@
+# Post-processing configuration — source of truth for ML dataset export,
+# quality control, and the visualization tool.
+
+ml_dataset:
+  # Crop box in chord-normalized coordinates (LE at x=0, TE at x=1).
+  bounding_box:
+    x: [-1.5, 3.5]
+    y: [-1.5, 1.5]
+
+  output_format: npz          # npz | h5
+  dtype: float32              # float32 | float64
+  crop: true
+
+  metadata_csv:
+    columns:
+      - file_name
+      - case_id
+      - naca_code
+      - aoa_deg
+      - reynolds
+      - u_inlet_x
+      - u_inlet_y
+      - u_mag
+      - cl
+      - cd
+
+visualize:
+  wall_sdf_threshold: 0.005
+  resolution: 600             # grid width in pixels (height auto-scales)
+  dpi: 150
+  panels:                     # 2x2 panel layout
+    - { key: u,   title: "$u$ (velocity x)",    cmap: RdBu_r,   diverging: true }
+    - { key: v,   title: "$v$ (velocity y)",    cmap: RdBu_r,   diverging: true }
+    - { key: p,   title: "$p$ (pressure)",      cmap: coolwarm, diverging: true }
+    - { key: sdf, title: "SDF (wall distance)", cmap: viridis,  diverging: false }
+
+qc:
+  orders_drop_min: 4.0        # reject if any residual drops < this many orders
+  y_plus_max: 5.0             # reject if max y+ exceeds this
+  iter_limit: 5000            # flag if solver hits this iteration count

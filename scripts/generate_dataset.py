@@ -1,7 +1,7 @@
 """End-to-end driver — the single entry point for §1–§9 of the dataset spec.
 
 Usage:
-    python dataset/scripts/generate_dataset.py \
+    uv run python scripts/generate_dataset.py \\
         --n-profiles 50 --n-cases 200 --n-ood 10 --seed 0
 
 What it does, in order:
@@ -14,140 +14,73 @@ What it does, in order:
     6.  For each case: setup OF case → mesh → run simpleFoam → extract
         HDF5 → quality check → write meta.yaml.
 
-Per-case flags `--skip-of` (skips meshing+solver+extraction; useful for the
-manifest+splits-only smoke test) and `--max-iter` (overrides §5.7 endTime
+Per-case flags ``--skip-of`` (skips meshing+solver+extraction; useful for the
+manifest+splits-only smoke test) and ``--max-iter`` (overrides §5.7 endTime
 for development) are provided.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
-import math
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 import yaml
-from scipy.stats import qmc
 
-# Allow running both as `python dataset/scripts/generate_dataset.py` and
-# `python -m dataset.scripts.generate_dataset` by adding our own dir to
-# sys.path when invoked as a module.
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from common import (
+from core import (
     CASES_DIR,
     DATASET_ROOT,
     ENVELOPE,
     MANIFEST_PATH,
     MESH_VERSION,
     NU,
+    OPENFOAM_CONFIG_PATH,
     OPENFOAM_VERSION,
-    REJECTION_LOG_PATH,
     SPLITS_DIR,
     CaseSpec,
-    md5_of_paths,
     setup_logging,
 )
-from generate_geometry import assign_splits, sample_naca_profiles
-from generate_mesh import generate_mesh
-from generate_c_mesh import generate_c_mesh
-from setup_openfoam_case import setup_openfoam_case
-from run_openfoam import run_simple_foam
-from extract_fields import extract_case
-from quality_check import append_rejection, quality_check
+from geometry.sampling import (
+    assign_splits,
+    sample_cases,
+    sample_fill_cases,
+    sample_naca_profiles,
+    sample_ood_cases,
+)
+from meshing import generate_c_mesh, generate_mesh
+from openfoam_setup import (
+    append_rejection,
+    extract_case,
+    quality_check,
+    run_simple_foam,
+    setup_openfoam_case,
+)
 
 LOG = setup_logging()
 
 
-# ---------------------------------------------------------------------------
-# §2.2 case sampling
-# ---------------------------------------------------------------------------
-
-def sample_cases(profiles: list[dict], split_by_profile: dict[str, list[str]],
-                 n_cases: int, seed: int) -> list[CaseSpec]:
-    """LHS over (profile_index, AoA, log10 Re) within the §1 envelope."""
-    profile_codes = [p["naca_code"] for p in profiles]
-    code_to_split = {}
-    for split, codes in split_by_profile.items():
-        for c in codes:
-            code_to_split[c] = split
-
-    sampler = qmc.LatinHypercube(d=3, seed=seed + 1)
-    u = sampler.random(n_cases)
-    aoa = ENVELOPE["aoa_min_deg"] + u[:, 1] * (ENVELOPE["aoa_max_deg"] - ENVELOPE["aoa_min_deg"])
-    log_re_lo = math.log10(ENVELOPE["re_min"])
-    log_re_hi = math.log10(ENVELOPE["re_max"])
-    log_re = log_re_lo + u[:, 2] * (log_re_hi - log_re_lo)
-    re_values = 10 ** log_re
-
-    n_profiles = len(profile_codes)
-    profile_idx = np.minimum((u[:, 0] * n_profiles).astype(int), n_profiles - 1)
-
-    cases: list[CaseSpec] = []
-    seen = set()
-    for i, p_idx in enumerate(profile_idx):
-        code = profile_codes[p_idx]
-        # Round AoA to 1 decimal place so case IDs are unique-ish on collision
-        aoa_i = round(float(aoa[i]), 1)
-        re_i = float(re_values[i])
-        spec = CaseSpec.build(code, aoa_i, re_i, code_to_split[code])
-        if spec.case_id in seen:
-            continue
-        seen.add(spec.case_id)
-        cases.append(spec)
-    return cases
-
-
-# ---------------------------------------------------------------------------
-# §2.3 OOD probe sampling
-# ---------------------------------------------------------------------------
-
-def sample_ood_cases(profiles: list[dict], n_ood: int, seed: int) -> list[CaseSpec]:
-    """Atypical conditions: AoA > 15°, Re < 1e5, Re > 1e7."""
-    rng = np.random.default_rng(seed + 2)
-    codes = [p["naca_code"] for p in profiles]
-    cases: list[CaseSpec] = []
-    if not codes or n_ood == 0:
-        return cases
-    per_kind = max(1, n_ood // 3)
-    # high AoA
-    for _ in range(per_kind):
-        c = rng.choice(codes)
-        cases.append(CaseSpec.build(
-            c, float(rng.uniform(15.5, 20.0)),
-            float(10 ** rng.uniform(5.5, 6.5)),
-            "ood_probe",
-        ))
-    # low Re
-    for _ in range(per_kind):
-        c = rng.choice(codes)
-        cases.append(CaseSpec.build(
-            c, float(rng.uniform(0.0, 8.0)),
-            float(10 ** rng.uniform(4.0, 4.99)),
-            "ood_probe",
-        ))
-    # high Re
-    for _ in range(n_ood - 2 * per_kind):
-        c = rng.choice(codes)
-        cases.append(CaseSpec.build(
-            c, float(rng.uniform(0.0, 8.0)),
-            float(10 ** rng.uniform(7.01, 7.7)),
-            "ood_probe",
-        ))
-    # Dedupe
-    seen = set()
-    out: list[CaseSpec] = []
-    for c in cases:
-        if c.case_id not in seen:
-            seen.add(c.case_id)
-            out.append(c)
-    return out
+def _to_native(obj):
+    """Recursively coerce numpy scalars / arrays to Python types for yaml."""
+    if isinstance(obj, dict):
+        return {str(k): _to_native(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_native(x) for x in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.str_, np.bytes_)):
+        return str(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    return obj
 
 
 # ---------------------------------------------------------------------------
@@ -164,13 +97,8 @@ def write_splits(cases: list[CaseSpec]) -> None:
 
 
 def solver_settings_hash() -> str:
-    """md5 over the pristine fvSchemes/fvSolution we write per case."""
-    from setup_openfoam_case import FV_SCHEMES, FV_SOLUTION
-    import hashlib
-    h = hashlib.md5()
-    h.update(FV_SCHEMES.encode())
-    h.update(FV_SOLUTION.encode())
-    return h.hexdigest()
+    """md5 of configs/openfoam.yaml — replaces the old fvSchemes+fvSolution hash."""
+    return hashlib.md5(OPENFOAM_CONFIG_PATH.read_bytes()).hexdigest()
 
 
 def write_manifest(profiles: list[dict], splits: dict[str, list[str]],
@@ -206,25 +134,6 @@ def write_manifest(profiles: list[dict], splits: dict[str, list[str]],
 # ---------------------------------------------------------------------------
 # Per-case meta.yaml (§6.5)
 # ---------------------------------------------------------------------------
-
-def _to_native(obj):
-    """Recursively coerce numpy scalars / arrays to Python types for yaml."""
-    if isinstance(obj, dict):
-        return {str(k): _to_native(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_to_native(x) for x in obj]
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, (np.str_, np.bytes_)):
-        return str(obj)
-    if isinstance(obj, (np.bool_,)):
-        return bool(obj)
-    return obj
-
 
 def write_meta(spec: CaseSpec, qc_result: dict, mesh_quality: dict | None,
                solver_hash: str) -> None:
@@ -269,7 +178,6 @@ def run_case(spec: CaseSpec, args: argparse.Namespace, solver_hash: str) -> dict
     spec.of_case_dir.mkdir(parents=True, exist_ok=True)
 
     mesh_quality = None
-    extraction = None
     qc_result = {"accepted": False, "rejections": ["pipeline_not_run"],
                  "flags": [], "metrics": {}}
 
@@ -284,13 +192,12 @@ def run_case(spec: CaseSpec, args: argparse.Namespace, solver_hash: str) -> dict
         else:
             mesher = generate_c_mesh if args.c_mesh else generate_mesh
             mesh_quality = mesher(spec.of_case_dir, spec.case_id)
-            rc = run_simple_foam(spec.of_case_dir,
-                                 timeout=args.solver_timeout)
+            rc = run_simple_foam(spec.of_case_dir, timeout=args.solver_timeout)
             if rc != 0:
                 LOG.warning("[%s] simpleFoam exited with rc=%d; "
                             "extraction may reflect unconverged fields",
                             spec.case_id, rc)
-            extraction = extract_case(spec.of_case_dir, spec.case_dir, spec.case_id)
+            extract_case(spec.of_case_dir, spec.case_dir, spec.case_id)
             qc_result = quality_check(spec.case_dir, max_iter=args.max_iter)
             if not qc_result["accepted"]:
                 append_rejection(spec.case_id, qc_result["rejections"])
@@ -328,7 +235,6 @@ def get_existing_cases() -> tuple[set[str], set[str]]:
 
 
 def get_split_case_ids() -> set[str]:
-    """Read every splits/*.txt and return the union of all case IDs."""
     ids: set[str] = set()
     if SPLITS_DIR.exists():
         for f in SPLITS_DIR.glob("*.txt"):
@@ -340,7 +246,6 @@ def get_split_case_ids() -> set[str]:
 
 
 def append_to_splits(new_cases: list[CaseSpec]) -> None:
-    """Merge new cases into the existing split files (non-destructive)."""
     SPLITS_DIR.mkdir(parents=True, exist_ok=True)
     by_split: dict[str, set[str]] = {}
     for f in SPLITS_DIR.glob("*.txt"):
@@ -352,40 +257,11 @@ def append_to_splits(new_cases: list[CaseSpec]) -> None:
         (SPLITS_DIR / f"{split_name}.txt").write_text("\n".join(sorted(ids)) + "\n")
 
 
-def sample_fill_cases(profiles: list[dict], splits: dict[str, list[str]],
-                      exclude_ids: set[str], n_needed: int,
-                      base_seed: int) -> list[CaseSpec]:
-    """Sample new cases that don't overlap with exclude_ids.
-
-    Samples in batches with increasing seeds until we have at least
-    2 * n_needed candidates, giving a buffer in case some get rejected.
-    """
-    new_cases: list[CaseSpec] = []
-    seen_new: set[str] = set()
-    seed_offset = 10_000
-    target_buffer = n_needed * 2
-
-    while len(new_cases) < target_buffer and seed_offset < 10_000_000:
-        batch = sample_cases(profiles, splits,
-                             n_cases=max(n_needed * 5, 100),
-                             seed=base_seed + seed_offset)
-        for c in batch:
-            if c.case_id not in exclude_ids and c.case_id not in seen_new:
-                new_cases.append(c)
-                seen_new.add(c.case_id)
-        seed_offset += 10_000
-
-    LOG.info("Sampled %d fill candidates (want %d accepted)", len(new_cases), n_needed)
-    return new_cases
-
-
 # ---------------------------------------------------------------------------
 # Reproducibility check (§9 — re-run a few cases and compare fields)
 # ---------------------------------------------------------------------------
 
 def repro_check(case_specs: list[CaseSpec], n: int) -> dict:
-    """Re-run the first `n` accepted cases and verify field hashes match."""
-    import hashlib
     import h5py
     out: dict[str, dict] = {}
     accepted = [s for s in case_specs if (s.case_dir / "fields.h5").exists()][:n]
@@ -404,25 +280,19 @@ def repro_check(case_specs: list[CaseSpec], n: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="End-to-end CFD dataset generation pipeline.",
-    )
+    p = argparse.ArgumentParser(description="End-to-end CFD dataset generation pipeline.")
     p.add_argument("--n-profiles", type=int, default=50,
                    help="Unique NACA profiles to sample (target ≥160 for full run).")
     p.add_argument("--n-cases", type=int, default=100,
                    help="Cases to draw via joint LHS (target ~500 for full run).")
-    p.add_argument("--n-ood", type=int, default=10,
-                   help="OOD probe cases.")
+    p.add_argument("--n-ood", type=int, default=10, help="OOD probe cases.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-iter", type=int, default=5000,
                    help="Solver endTime (§5.7 max iterations).")
     p.add_argument("--solver-timeout", type=int, default=6 * 3600,
                    help="Per-case solver wall-clock timeout (seconds).")
     p.add_argument("--c-mesh", action="store_true",
-                   help="Use the structured C-mesh generator (generate_c_mesh.py) "
-                        "instead of the default Gmsh unstructured mesher. Closed-TE "
-                        "airfoil + bisector wake + half-circle far-field; written via "
-                        "the same gmshToFoam path as the default mesher.")
+                   help="Use the structured C-mesh generator instead of the default Gmsh.")
     p.add_argument("--skip-of", action="store_true",
                    help="Skip mesh generation, solver, and extraction (manifest+meta only).")
     p.add_argument("--cases", nargs="*",
@@ -432,16 +302,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workers", type=int, default=1,
                    help="Number of cases to run in parallel (default: 1 = serial).")
     p.add_argument("--fill", action="store_true",
-                   help="Fill mode: scan cases/ and splits/ to find already-run cases, "
-                        "then sample and run only new cases until --n-cases accepted "
-                        "cases exist in total. Splits files are updated in-place; the "
-                        "manifest is left untouched.")
+                   help="Fill mode: scan cases/ and splits/ for already-run cases, then "
+                        "sample only new cases until --n-cases accepted cases exist.")
     return p.parse_args()
 
 
 def _run_cases_parallel(all_cases: list[CaseSpec], args: argparse.Namespace,
                          solver_hash: str) -> tuple[int, int]:
-    """Run cases with a process pool; return (n_accepted, n_rejected)."""
     n_accepted = n_rejected = 0
     LOG.info("Running %d cases with %d parallel workers", len(all_cases), args.workers)
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
@@ -468,10 +335,6 @@ def _run_cases_parallel(all_cases: list[CaseSpec], args: argparse.Namespace,
 def _run_cases_serial(all_cases: list[CaseSpec], args: argparse.Namespace,
                       solver_hash: str, stop_after_accepted: int | None = None
                       ) -> tuple[int, int, list[CaseSpec]]:
-    """Run cases one by one; return (n_accepted, n_rejected, cases_run).
-
-    If stop_after_accepted is set, stops as soon as that many cases are accepted.
-    """
     n_accepted = n_rejected = 0
     cases_run: list[CaseSpec] = []
     for i, spec in enumerate(all_cases, 1):
@@ -503,10 +366,6 @@ def main() -> None:
     solver_hash = solver_settings_hash()
     t0 = time.time()
 
-    # ------------------------------------------------------------------
-    # Fill mode: top-up accepted cases to --n-cases without re-running
-    # anything that already has a case directory (tried or accepted).
-    # ------------------------------------------------------------------
     if args.fill:
         existing_tried, existing_accepted = get_existing_cases()
         split_ids = get_split_case_ids()
@@ -549,9 +408,6 @@ def main() -> None:
             )
         return
 
-    # ------------------------------------------------------------------
-    # Normal (fresh) mode
-    # ------------------------------------------------------------------
     LOG.info("§2.2  sampling %d in-domain cases", args.n_cases)
     cases = sample_cases(profiles, splits, n_cases=args.n_cases, seed=args.seed)
 

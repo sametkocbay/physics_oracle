@@ -1,8 +1,6 @@
 """§7 — Run quality-control checks on a generated case.
 
-Reads fields.h5, convergence.h5 from the case directory and applies the
-threshold table from §7.  Returns (accepted, reasons, flags) and appends a
-row to rejection_log.csv when a case is rejected.
+Thresholds are loaded from configs/postprocess.yaml at module import time.
 """
 from __future__ import annotations
 
@@ -10,26 +8,30 @@ import argparse
 import csv
 import datetime as dt
 import fcntl
+from functools import lru_cache
 from pathlib import Path
 
 import h5py
 import numpy as np
+import yaml
 
-from common import REJECTION_LOG_PATH, setup_logging
+from core.logging import setup_logging
+from core.paths import POSTPROCESS_CONFIG_PATH, REJECTION_LOG_PATH
 
 LOG = setup_logging()
 
 
-# ---------------------------------------------------------------------------
-# Threshold table  (§7)
-# ---------------------------------------------------------------------------
-
-ORDERS_DROP_MIN = 4.0
-Y_PLUS_MAX = 5.0
-ITER_LIMIT = 5000
+@lru_cache(maxsize=1)
+def _qc_config() -> dict:
+    return yaml.safe_load(POSTPROCESS_CONFIG_PATH.read_text())["qc"]
 
 
-def quality_check(case_dir: Path, max_iter: int = ITER_LIMIT) -> dict:
+def quality_check(case_dir: Path, max_iter: int | None = None) -> dict:
+    cfg = _qc_config()
+    orders_drop_min = float(cfg["orders_drop_min"])
+    y_plus_max = float(cfg["y_plus_max"])
+    iter_limit = int(max_iter if max_iter is not None else cfg["iter_limit"])
+
     fields_path = case_dir / "fields.h5"
     conv_path = case_dir / "convergence.h5"
 
@@ -64,26 +66,17 @@ def quality_check(case_dir: Path, max_iter: int = ITER_LIMIT) -> dict:
         "drops": drops,
     }
 
-    # §7 Residuals dropped < 4 orders → reject
-    if any(v < ORDERS_DROP_MIN for v in drops.values()):
+    if any(v < orders_drop_min for v in drops.values()):
         rejections.append("residuals_under_4_orders")
     if not drops:
         rejections.append("no_residuals_parsed")
-
-    # §7 Negative k anywhere
     if k.size and np.any(k < 0):
         rejections.append("negative_k")
-
-    # §7 Negative omega anywhere
     if omega.size and np.any(omega < 0):
         rejections.append("negative_omega")
-
-    # §7 y+ > 5 → reject
-    if y_plus.size and np.nanmax(y_plus) > Y_PLUS_MAX:
+    if y_plus.size and np.nanmax(y_plus) > y_plus_max:
         rejections.append("y_plus_over_5")
-
-    # §7 > 5000 iterations → flag (implies non-convergence)
-    if iters_total >= max_iter:
+    if iters_total >= iter_limit:
         flags.append("max_iterations_hit")
     if not converged:
         flags.append("did_not_converge")
@@ -96,10 +89,6 @@ def quality_check(case_dir: Path, max_iter: int = ITER_LIMIT) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Rejection log
-# ---------------------------------------------------------------------------
-
 def append_rejection(case_id: str, reasons: list[str],
                      log_path: Path = REJECTION_LOG_PATH) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,7 +96,7 @@ def append_rejection(case_id: str, reasons: list[str],
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
             w = csv.writer(f)
-            if f.seek(0, 2) == 0:  # empty file — write header
+            if f.seek(0, 2) == 0:
                 w.writerow(["case_id", "reason", "timestamp"])
             w.writerow([
                 case_id,
@@ -117,10 +106,6 @@ def append_rejection(case_id: str, reasons: list[str],
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run QC on a single case directory.")
