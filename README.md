@@ -1,7 +1,22 @@
-# CFD Data Generator
-## RANS k-ω SST Dataset for 2D Airfoil Flow
+# physics_oracle
+## OpenFOAM-backed CFD oracle for 2D NACA airfoils (RANS k-ω SST)
 
-Implementation reference for generating the dataset. Covers sampling, meshing, OpenFOAM setup, field extraction, quality control, and ML export. Follow the sections in order.
+`physics_oracle` is an installable Python package (`pip install` / `uv add`)
+that wraps an OpenFOAM 2D airfoil pipeline. It does three things:
+
+- **Dataset generation** — sample NACA profiles, mesh, solve, extract, and
+  export an ML-ready dataset (`physics-oracle-generate`, `physics-oracle-build-ml`).
+- **ML warm-start** — take an ML-predicted flow field, run an OpenFOAM step
+  initialized from it, and report residuals (`physics-oracle-run-step` /
+  `from physics_oracle import run_step`).
+- **Reusable building blocks** — NACA geometry, meshing, OpenFOAM case setup,
+  field extraction, and `mesh.h5 → polyMesh` conversion, all importable under
+  the `physics_oracle.*` namespace.
+
+It installs as a single top-level package and is meant to be consumed by other
+projects (see §9 — *Using `physics_oracle` from another project*). The sections
+below cover sampling, meshing, OpenFOAM setup, field extraction, quality
+control, and ML export, in order.
 
 ---
 
