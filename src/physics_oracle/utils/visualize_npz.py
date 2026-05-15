@@ -24,7 +24,7 @@ import numpy as np
 import yaml
 from scipy.interpolate import LinearNDInterpolator
 
-from core.paths import POSTPROCESS_CONFIG_PATH
+from physics_oracle.core.paths import POSTPROCESS_CONFIG_PATH
 
 
 @lru_cache(maxsize=1)

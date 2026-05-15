@@ -10,4 +10,4 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    return logging.getLogger("cfd_data_generator")
+    return logging.getLogger("physics_oracle")

@@ -23,10 +23,10 @@ import h5py
 import numpy as np
 from scipy.spatial import cKDTree
 
-from core.case_spec import parse_case_id
-from core.logging import setup_logging
-from geometry.naca import naca4_coordinates
-from openfoam_setup.runner import detect_convergence, parse_solver_log
+from physics_oracle.core.case_spec import parse_case_id
+from physics_oracle.core.logging import setup_logging
+from physics_oracle.geometry.naca import naca4_coordinates
+from physics_oracle.openfoam_setup.runner import detect_convergence, parse_solver_log
 
 
 def _first_converged_iter(history: dict[str, list[float]]) -> int:

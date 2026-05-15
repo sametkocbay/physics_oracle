@@ -15,8 +15,8 @@ import h5py
 import numpy as np
 import yaml
 
-from core.logging import setup_logging
-from core.paths import POSTPROCESS_CONFIG_PATH, REJECTION_LOG_PATH
+from physics_oracle.core.logging import setup_logging
+from physics_oracle.core.paths import POSTPROCESS_CONFIG_PATH, REJECTION_LOG_PATH
 
 LOG = setup_logging()
 

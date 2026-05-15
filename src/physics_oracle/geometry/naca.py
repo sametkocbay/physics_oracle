@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from core.envelope import CHORD
+from physics_oracle.core.envelope import CHORD
 
 
 def naca4_code(camber_pct: float, position_pct: float, thickness_pct: float) -> str:

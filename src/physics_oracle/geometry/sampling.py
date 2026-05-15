@@ -10,9 +10,9 @@ import math
 import numpy as np
 from scipy.stats import qmc
 
-from core.case_spec import CaseSpec
-from core.envelope import ENVELOPE
-from core.logging import setup_logging
+from physics_oracle.core.case_spec import CaseSpec
+from physics_oracle.core.envelope import ENVELOPE
+from physics_oracle.core.logging import setup_logging
 
 from .naca import naca4_code
 

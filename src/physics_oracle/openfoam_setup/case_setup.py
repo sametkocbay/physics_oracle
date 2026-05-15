@@ -20,11 +20,16 @@ from pathlib import Path
 
 import yaml
 
-from core.case_spec import CaseSpec, parse_case_id
-from core.logging import setup_logging
-from core.paths import OPENFOAM_CONFIG_PATH
+from physics_oracle.core.case_spec import CaseSpec, parse_case_id
+from physics_oracle.core.logging import setup_logging
+from physics_oracle.core.paths import OPENFOAM_CONFIG_PATH
 
-from .of_writer import render_foam_dict
+from ._residual_functions import SOLVER_INFO_BLOCK
+from .of_writer import (
+    render_foam_dict,
+    render_nonuniform_scalar,
+    render_nonuniform_vector,
+)
 
 LOG = setup_logging()
 
@@ -156,6 +161,97 @@ def setup_openfoam_case(of_case_dir: Path, spec: CaseSpec,
     write_constant_dir(of_case_dir / "constant", cfg)
     write_system_dir(of_case_dir / "system", cfg, mapping, end_time, effective_interval)
     LOG.info("[%s] OpenFOAM case files written under %s", spec.case_id, of_case_dir)
+
+
+# ---------------------------------------------------------------------------
+# ML-warm-started variant — nonuniform initialFields + optional residual capture
+# ---------------------------------------------------------------------------
+
+def _patch_internal_field(bc_field: dict, rendered: str) -> None:
+    """Replace the `internalField` entry in a BC tree with a pre-rendered
+    nonuniform list string.  The OF dict renderer emits whatever string we
+    give it verbatim after `internalField   `, so we can pass the whole
+    `nonuniform List<scalar>\\n N\\n (\\n ... \\n)` blob as a single value."""
+    bc_field["internalField"] = rendered
+
+
+def write_zero_dir_with_fields(
+    zero_dir: Path,
+    spec: CaseSpec,
+    cfg: dict,
+    mapping: dict[str, str],
+    fields: dict,
+) -> None:
+    """Like write_zero_dir, but `internalField` for each rendered field comes
+    from `fields` (numpy arrays) instead of the per-case scalar in the YAML."""
+    zero_dir.mkdir(parents=True, exist_ok=True)
+    bc = _substitute(cfg["boundary_conditions"], mapping)
+    field_classes = cfg["field_classes"]
+
+    # Patch internalField for each ML-provided field.
+    if "U" in fields:
+        _patch_internal_field(bc["U"], render_nonuniform_vector(fields["U"]))
+    if "p" in fields:
+        _patch_internal_field(bc["p"], render_nonuniform_scalar(fields["p"]))
+    if "k" in fields:
+        _patch_internal_field(bc["k"], render_nonuniform_scalar(fields["k"]))
+    if "omega" in fields:
+        _patch_internal_field(bc["omega"], render_nonuniform_scalar(fields["omega"]))
+    if "nut" in fields:
+        _patch_internal_field(bc["nut"], render_nonuniform_scalar(fields["nut"]))
+    # phi is intentionally left uniform 0 — OF rebuilds it from U.
+
+    for field in ("U", "p", "k", "omega", "nut", "phi"):
+        _write_field(zero_dir, field, field_classes[field], bc[field])
+
+
+def setup_case_with_initial_fields(
+    of_case_dir: Path,
+    spec: CaseSpec,
+    fields: dict,
+    *,
+    end_time: int,
+    enable_residual_capture: bool,
+    write_interval: int | None = None,
+) -> None:
+    """Write a complete OpenFOAM case with ML-provided initial fields.
+
+    Parameters
+    ----------
+    of_case_dir
+        Target directory.  Must already contain `constant/polyMesh/` if the
+        caller plans to run foamRun afterwards.
+    spec
+        Case spec — drives the boundary-condition values (inlet U, k, omega).
+    fields
+        Dict with keys ``U`` (N, 3), ``p`` (N,), ``k`` (N,), ``omega`` (N,),
+        ``nut`` (N,).  Any missing key falls back to the uniform inlet value.
+    end_time
+        Solver endTime (1 for residual-only mode, ~500 for a warm-start run).
+    enable_residual_capture
+        If True, splice a ``solverInfo`` function object into controlDict so
+        the run writes per-cell ``initialResidual:U``, ``initialResidual:p``,
+        ``initialResidual:k``, ``initialResidual:omega`` volScalarFields.
+    write_interval
+        controlDict writeInterval.  Defaults to `end_time` (write once at the
+        end), which is what both residual-only and short warm-start runs want.
+    """
+    of_case_dir.mkdir(parents=True, exist_ok=True)
+    write_interval = write_interval if write_interval is not None else end_time
+
+    cfg = copy.deepcopy(_load_config())
+    mapping = _per_case_mapping(spec, end_time, write_interval)
+
+    if enable_residual_capture and SOLVER_INFO_BLOCK:
+        cfg["control_dict"]["functions"]["solverInfo"] = copy.deepcopy(SOLVER_INFO_BLOCK)
+    # else: the standard ``residuals`` block already in configs/openfoam.yaml
+    # captures scalar per-iteration residuals to postProcessing/residuals/.
+
+    write_zero_dir_with_fields(of_case_dir / "0", spec, cfg, mapping, fields)
+    write_constant_dir(of_case_dir / "constant", cfg)
+    write_system_dir(of_case_dir / "system", cfg, mapping, end_time, write_interval)
+    LOG.info("[%s] ML-warm-started case written under %s (residuals=%s, endTime=%d)",
+             spec.case_id, of_case_dir, enable_residual_capture, end_time)
 
 
 # ---------------------------------------------------------------------------

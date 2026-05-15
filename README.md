@@ -260,13 +260,13 @@ N ≈ 220 000 points per case (after bounding-box crop from ~281 000 total cells
 
 ```bash
 # Default: .npz output to dataset/ML_dataset/
-uv run python scripts/build_ml_dataset.py
+uv run physics-oracle-build-ml
 
 # HDF5 output
-uv run python scripts/build_ml_dataset.py --fmt h5
+uv run physics-oracle-build-ml --fmt h5
 
 # Custom paths
-uv run python scripts/build_ml_dataset.py \
+uv run physics-oracle-build-ml \
     --cases-dir dataset/cases \
     --output-dir dataset/ML_dataset
 ```
@@ -291,24 +291,53 @@ Install dependencies once with [uv](https://docs.astral.sh/uv/):
 uv sync
 ```
 
-Then run the orchestrator:
+This installs `physics_oracle` as an importable package and puts three console
+scripts on PATH.
 
 ```bash
 # Full run: 50 profiles, 200 cases, 10 OOD
-uv run python scripts/generate_dataset.py \
+uv run physics-oracle-generate \
     --n-profiles 50 --n-cases 200 --n-ood 10 --seed 0
 
 # Manifest + splits only (no meshing/solving)
-uv run python scripts/generate_dataset.py \
+uv run physics-oracle-generate \
     --n-profiles 50 --n-cases 200 --skip-of
 
 # Run specific cases
-uv run python scripts/generate_dataset.py \
+uv run physics-oracle-generate \
     --n-profiles 50 --n-cases 200 \
     --cases NACA2412_p5.0_3.0e5 NACA0012_p0.0_2.0e5
 
 # After cases are done, build the ML dataset
-uv run python scripts/build_ml_dataset.py
+uv run physics-oracle-build-ml
+
+# Warm-start an OpenFOAM run from an ML prediction (.pt) on a saved mesh.h5
+uv run physics-oracle-run-step \
+    --prediction predictions.pt --mesh NACA2412_p5.0_3.0e5_mesh.h5 \
+    --work-dir /tmp/run01 --only-residual
+```
+
+Runtime outputs default to `<cwd>/dataset/`; override with the
+`PHYSICS_ORACLE_DATASET_ROOT` environment variable.
+
+### Using `physics_oracle` from another project
+
+`physics_oracle` is a normal installable package. From another repo's
+`pyproject.toml` (uv example):
+
+```toml
+[project]
+dependencies = ["physics-oracle"]
+
+[tool.uv.sources]
+physics-oracle = { path = "/path/to/physics_oracle", editable = true }
+# or, git-pinned for CI:
+# physics-oracle = { git = "https://github.com/sametkocbay/physics_oracle.git", rev = "<sha>" }
+```
+
+```python
+from physics_oracle import run_step, write_polymesh_from_h5, compute_inlet_conditions
+result = run_step(prediction, mesh_h5, work_dir, mode="only-residual")
 ```
 
 ---
@@ -316,38 +345,37 @@ uv run python scripts/build_ml_dataset.py
 ## 10. Full Directory Layout
 
 ```
-cfd_data_generator/
-├── pyproject.toml                      # uv / hatchling — declares the four src/ packages
+physics_oracle/
+├── pyproject.toml                          # uv / hatchling — single physics_oracle package
 ├── uv.lock
-├── configs/
-│   ├── openfoam.yaml                   # solver + BC + turbulence (source of truth)
-│   └── postprocess.yaml                # ML crop box, fields, QC thresholds, viz panels
-├── src/
-│   ├── core/                           # CaseSpec, paths, envelope, logging, repro
-│   ├── geometry/                       # NACA math + LHS sampling
-│   ├── meshing/                        # Gmsh unstructured + structured C-mesh
-│   └── openfoam_setup/                 # case_setup + of_writer, runner, extract, qc
-├── scripts/
-│   ├── generate_dataset.py             # main orchestrator — runs the full pipeline
-│   └── build_ml_dataset.py             # crops + exports ML_dataset/*.npz
-├── utils/
-│   └── visualize_npz.py                # 2x2 panel renderer for ML_dataset samples
-└── dataset/                            # runtime outputs (gitignored)
-    ├── manifest.yaml                   # dataset-level metadata, seeds, envelope
-    ├── rejection_log.csv               # QC rejections: case_id, reason, timestamp
-    ├── splits/                         # train.txt, val.txt, test.txt, ood_probe.txt
-    ├── cases/<case_id>/
-    │   ├── meta.yaml
-    │   ├── fields.h5
-    │   ├── mesh.h5
-    │   ├── geometry.h5
-    │   ├── convergence.h5
-    │   └── of_case/                    # 0/, constant/, system/
-    └── ML_dataset/                     # per-split subfolders with .npz + metadata.csv
-        ├── train/
-        ├── val/
-        ├── test/
-        └── ood/                        (if any ood cases exist)
+└── src/
+    └── physics_oracle/
+        ├── __init__.py                     # public API re-exports
+        ├── configs/
+        │   ├── openfoam.yaml               # solver + BC + turbulence (source of truth)
+        │   └── postprocess.yaml            # ML crop box, fields, QC thresholds, viz panels
+        ├── core/                           # CaseSpec, paths, envelope, logging, repro
+        ├── geometry/                       # NACA math + LHS sampling
+        ├── meshing/                        # Gmsh unstructured + structured C-mesh
+        ├── openfoam_setup/                 # case_setup, of_writer, runner, extract, qc,
+        │                                   #   mesh_h5_to_polymesh
+        ├── utils/                          # visualize_npz
+        └── cli/                            # generate_dataset, build_ml_dataset,
+                                            #   run_ml_initialized_step
+```
+
+Runtime outputs (gitignored) land under `<cwd>/dataset/` — or
+`$PHYSICS_ORACLE_DATASET_ROOT` — as:
+
+```
+dataset/
+├── manifest.yaml                       # dataset-level metadata, seeds, envelope
+├── rejection_log.csv                   # QC rejections: case_id, reason, timestamp
+├── splits/                             # train.txt, val.txt, test.txt, ood_probe.txt
+├── cases/<case_id>/                    # meta.yaml, fields.h5, mesh.h5, geometry.h5,
+│                                       #   convergence.h5, of_case/
+└── ML_dataset/                         # per-split subfolders with .npz + metadata.csv
+    ├── train/  ├── val/  ├── test/  └── ood/
 ```
 
 ---

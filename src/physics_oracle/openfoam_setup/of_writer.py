@@ -127,3 +127,117 @@ def render_foam_dict(cls: str, obj: str, body: dict) -> str:
     out.write("\n")
     _render_dict_body(body, depth=0, out=out)
     return out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Nonuniform field rendering (used by setup_case_with_initial_fields)
+# ---------------------------------------------------------------------------
+
+def render_nonuniform_scalar(arr) -> str:
+    """OpenFOAM ``nonuniform List<scalar>`` rendering for a 1-D numeric array."""
+    n = len(arr)
+    body = "\n".join(f"{float(v):.10g}" for v in arr)
+    return f"nonuniform List<scalar>\n{n}\n(\n{body}\n)"
+
+
+def render_nonuniform_vector(arr) -> str:
+    """OpenFOAM ``nonuniform List<vector>`` rendering for an (N, 3) array."""
+    n = len(arr)
+    body = "\n".join(
+        f"({float(v[0]):.10g} {float(v[1]):.10g} {float(v[2]):.10g})"
+        for v in arr
+    )
+    return f"nonuniform List<vector>\n{n}\n(\n{body}\n)"
+
+
+# ---------------------------------------------------------------------------
+# polyMesh file writers
+# ---------------------------------------------------------------------------
+
+_POINTS_HEADER = """/*--------------------------------*- C++ -*----------------------------------*\\
+  =========                 |
+  \\\\      /  F ield         | OpenFOAM dataset case (auto-generated)
+   \\\\    /   O peration     |
+    \\\\  /    A nd           |
+     \\\\/     M anipulation  |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{{
+    format      ascii;
+    class       {cls};
+    location    "constant/polyMesh";
+    object      {obj};
+}}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+"""
+
+
+def write_points(path, points) -> None:
+    """Write a ``constant/polyMesh/points`` file.  `points` is (N, 3)."""
+    n = len(points)
+    lines = [
+        _POINTS_HEADER.format(cls="vectorField", obj="points"),
+        f"{n}",
+        "(",
+    ]
+    lines.extend(
+        f"({float(p[0]):.10g} {float(p[1]):.10g} {float(p[2]):.10g})"
+        for p in points
+    )
+    lines.append(")")
+    lines.append("")
+    path.write_text("\n".join(lines))
+
+
+def write_label_list(path, values, obj: str) -> None:
+    """Write a ``labelList`` file (owner / neighbour)."""
+    n = len(values)
+    lines = [
+        _POINTS_HEADER.format(cls="labelList", obj=obj),
+        f"{n}",
+        "(",
+    ]
+    lines.extend(str(int(v)) for v in values)
+    lines.append(")")
+    lines.append("")
+    path.write_text("\n".join(lines))
+
+
+def write_face_list(path, faces) -> None:
+    """Write a ``constant/polyMesh/faces`` file.  `faces` is a list of
+    iterables of vertex indices (any length per face)."""
+    n = len(faces)
+    lines = [
+        _POINTS_HEADER.format(cls="faceList", obj="faces"),
+        f"{n}",
+        "(",
+    ]
+    for face in faces:
+        verts = list(face)
+        lines.append(f"{len(verts)}(" + " ".join(str(int(v)) for v in verts) + ")")
+    lines.append(")")
+    lines.append("")
+    path.write_text("\n".join(lines))
+
+
+def write_boundary(path, patches) -> None:
+    """Write a ``constant/polyMesh/boundary`` file.
+
+    `patches` is a list of dicts: {name, type, nFaces, startFace}.
+    """
+    lines = [_POINTS_HEADER.format(cls="polyBoundaryMesh", obj="boundary")]
+    lines.append(f"{len(patches)}")
+    lines.append("(")
+    for p in patches:
+        lines.append(f"    {p['name']}")
+        lines.append("    {")
+        lines.append(f"        type            {p['type']};")
+        if "physicalType" in p:
+            lines.append(f"        physicalType    {p['physicalType']};")
+        lines.append(f"        nFaces          {int(p['nFaces'])};")
+        lines.append(f"        startFace       {int(p['startFace'])};")
+        lines.append("    }")
+    lines.append(")")
+    lines.append("")
+    path.write_text("\n".join(lines))

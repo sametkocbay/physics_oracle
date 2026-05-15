@@ -18,10 +18,10 @@ from pathlib import Path
 
 import numpy as np
 
-from core.case_spec import parse_case_id
-from core.envelope import CHORD, NU
-from core.logging import setup_logging
-from geometry.naca import naca4_coordinates
+from physics_oracle.core.case_spec import parse_case_id
+from physics_oracle.core.envelope import CHORD, NU
+from physics_oracle.core.logging import setup_logging
+from physics_oracle.geometry.naca import naca4_coordinates
 
 LOG = setup_logging()
 

@@ -12,7 +12,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from core.logging import setup_logging
+from physics_oracle.core.logging import setup_logging
 
 LOG = setup_logging()
 

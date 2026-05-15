@@ -24,7 +24,7 @@ import h5py
 import numpy as np
 import yaml
 
-from core.paths import CASES_DIR, ML_DATASET_DIR, POSTPROCESS_CONFIG_PATH
+from physics_oracle.core.paths import CASES_DIR, ML_DATASET_DIR, POSTPROCESS_CONFIG_PATH
 
 
 def _load_config() -> dict:

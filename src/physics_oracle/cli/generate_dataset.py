@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from core import (
+from physics_oracle.core import (
     CASES_DIR,
     DATASET_ROOT,
     ENVELOPE,
@@ -45,15 +45,15 @@ from core import (
     CaseSpec,
     setup_logging,
 )
-from geometry.sampling import (
+from physics_oracle.geometry.sampling import (
     assign_splits,
     sample_cases,
     sample_fill_cases,
     sample_naca_profiles,
     sample_ood_cases,
 )
-from meshing import generate_c_mesh, generate_mesh
-from openfoam_setup import (
+from physics_oracle.meshing import generate_c_mesh, generate_mesh
+from physics_oracle.openfoam_setup import (
     append_rejection,
     extract_case,
     quality_check,
