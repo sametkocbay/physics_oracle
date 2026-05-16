@@ -16,6 +16,11 @@ Modes (mutually exclusive; default --full-run):
                      foamPostProcess — no SIMPLE iteration — writing the
                      volScalarFields momentumResidual / continuityResidual /
                      kResidual / omegaResidual into the case's 0/ directory.
+  --only-residual-diff
+                     Same per-cell residual, recomputed in PyTorch
+                     (residual_diff/) — no OpenFOAM solve, differentiable
+                     end-to-end so it can be used as a physics-informed loss.
+                     Mesh geometry is exported from OpenFOAM once and cached.
   --n-steps N        Solver-consistency probe.  Run N SIMPLE iterations
                      (1-5 recommended) warm-started from the prediction and
                      return OpenFOAM's own per-iteration residuals for
@@ -45,9 +50,10 @@ import numpy as np
 import torch
 from scipy.spatial import cKDTree
 
-from physics_oracle.core.case_spec import CaseSpec, compute_inlet_conditions
+from physics_oracle.core.case_spec import NU, CaseSpec, compute_inlet_conditions
 from physics_oracle.core.logging import setup_logging
 from physics_oracle.openfoam_setup._residual_functions import RESIDUAL_FIELDS
+from physics_oracle.residual_diff import DifferentiableResidual, export_mesh_geometry
 from physics_oracle.openfoam_setup.case_setup import setup_case_with_initial_fields
 from physics_oracle.openfoam_setup.extract import _read_text, parse_internal_field
 from physics_oracle.openfoam_setup.mesh_h5_to_polymesh import write_polymesh_from_h5
@@ -318,6 +324,9 @@ def parse_args() -> argparse.Namespace:
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--only-residual", action="store_true",
                       help="0-step: evaluate per-cell residual fields at the ML prediction")
+    mode.add_argument("--only-residual-diff", action="store_true",
+                      help="0-step, differentiable: same per-cell residual computed "
+                           "in PyTorch (no OpenFOAM solve) — autograd-friendly")
     mode.add_argument("--n-steps", type=int, metavar="N", default=None,
                       help="N-step probe: run N SIMPLE iterations (1-5 recommended) "
                            "and report OpenFOAM's per-iteration residuals")
@@ -335,9 +344,9 @@ def parse_args() -> argparse.Namespace:
 class StepResult:
     """Result of one OpenFOAM warm-start step."""
     of_case_dir: Path
-    mode: str                       # "only-residual" | "n-step" | "full-run"
+    mode: str                       # only-residual[-diff] | n-step | full-run
     exit_code: int
-    residuals: dict | None          # only-residual mode (see residual_mode)
+    residuals: dict | None          # only-residual[-diff] mode (see residual_mode)
     convergence: dict | None        # parsed log info — n-step and full-run modes
     residual_mode: str | None = None  # "spatial" | "summary" — only-residual mode
 
@@ -365,11 +374,13 @@ def run_step(
     Parameters
     ----------
     mode
-        ``"only-residual"`` — evaluate per-cell residual fields at the ML
-        prediction via foamPostProcess (no SIMPLE iteration).
-        ``"n-step"``         — run `n_steps` SIMPLE iterations and return
+        ``"only-residual"``      — per-cell residual fields at the ML prediction
+        via foamPostProcess (no SIMPLE iteration).
+        ``"only-residual-diff"`` — the same residual recomputed in PyTorch
+        (`residual_diff`), no OpenFOAM solve, differentiable.
+        ``"n-step"``             — run `n_steps` SIMPLE iterations and return
         OpenFOAM's per-iteration residuals in ``StepResult.convergence``.
-        ``"full-run"``       — endTime=500 SIMPLE run, returns convergence info.
+        ``"full-run"``           — endTime=500 SIMPLE run, returns convergence.
     naca, aoa_deg, re
         Override the values read from the prediction's `meta` dict.
     clean
@@ -382,9 +393,10 @@ def run_step(
     n_steps
         n-step mode only.  Number of SIMPLE iterations to run (1-5 recommended).
     """
-    if mode not in ("only-residual", "n-step", "full-run"):
+    if mode not in ("only-residual", "only-residual-diff", "n-step", "full-run"):
         raise ValueError(
-            f"mode must be 'only-residual', 'n-step' or 'full-run', got {mode!r}")
+            f"mode must be 'only-residual', 'only-residual-diff', 'n-step' or "
+            f"'full-run', got {mode!r}")
     if mode == "n-step" and n_steps < 1:
         raise ValueError(f"n_steps must be >= 1, got {n_steps}")
     prediction, mesh_h5, work_dir = Path(prediction), Path(mesh_h5), Path(work_dir)
@@ -428,6 +440,29 @@ def run_step(
              fields["U"][:, 0].min(), fields["U"][:, 0].max(),
              fields["U"][:, 1].min(), fields["U"][:, 1].max(),
              fields["p"].min(), fields["p"].max())
+
+    # ----- differentiable residual: pure PyTorch, no OpenFOAM solve -----
+    if mode == "only-residual-diff":
+        LOG.info("Computing differentiable residual (PyTorch)")
+        geom = export_mesh_geometry(mesh_h5, work_dir, spec)
+        model = DifferentiableResidual(geom, NU, inlet, dtype=torch.float64)
+        with torch.no_grad():
+            out = model(
+                torch.as_tensor(fields["U"], dtype=torch.float64),
+                torch.as_tensor(fields["p"], dtype=torch.float64),
+                torch.as_tensor(fields["k"], dtype=torch.float64),
+                torch.as_tensor(fields["omega"], dtype=torch.float64),
+                torch.as_tensor(fields["nut"], dtype=torch.float64),
+            )
+        per_cell = {key: val.numpy() for key, val in out.items()}
+        if spatial_residuals:
+            residuals, residual_mode = per_cell, "spatial"
+        else:
+            residuals = {n: _reduce(a) for n, a in per_cell.items()}
+            residual_mode = "summary"
+        return StepResult(
+            of_case_dir=work_dir / "geom_case", mode=mode, exit_code=0,
+            residuals=residuals, convergence=None, residual_mode=residual_mode)
 
     # ----- write polyMesh -----
     of_case = work_dir / "of_case"
@@ -483,6 +518,8 @@ def main() -> None:
     args = parse_args()
     if args.only_residual:
         mode = "only-residual"
+    elif args.only_residual_diff:
+        mode = "only-residual-diff"
     elif args.n_steps is not None:
         mode = "n-step"
     else:
@@ -503,14 +540,20 @@ def main() -> None:
     except (ValueError, FileNotFoundError) as exc:
         sys.exit(str(exc))
 
-    if result.mode == "only-residual":
+    if result.mode in ("only-residual", "only-residual-diff"):
+        diff = result.mode == "only-residual-diff"
+        if diff:
+            print("Differentiable PyTorch residual (no OpenFOAM solve):")
         report_residuals(result.residuals, result.residual_mode or "spatial")
         if result.residual_mode == "spatial" and result.residuals is not None:
-            npz_path = args.work_dir / "residuals.npz"
+            npz_path = args.work_dir / ("residuals_diff.npz" if diff
+                                        else "residuals.npz")
             np.savez(npz_path, **result.residuals)
             print()
             print(f"Per-cell residual arrays written to {npz_path}")
-            print(f"OpenFOAM residual volScalarFields under {result.of_case_dir / '0'}")
+            if not diff:
+                print(f"OpenFOAM residual volScalarFields under "
+                      f"{result.of_case_dir / '0'}")
     elif result.mode == "n-step":
         report_iterations(result.convergence)
         hist = result.convergence["history"]

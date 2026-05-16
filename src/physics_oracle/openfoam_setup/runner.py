@@ -79,6 +79,35 @@ def run_residual_postprocess(of_case_dir: Path, log_path: Path | None = None,
     return proc.returncode
 
 
+def run_geometry_export(of_case_dir: Path, log_path: Path | None = None,
+                        timeout: int = 60 * 30) -> int:
+    """Run the `meshGeometry` coded function object via `foamPostProcess`.
+
+    Identical mechanism to `run_residual_postprocess` — `foamPostProcess`
+    constructs the mesh and executes the controlDict functions on the `0/`
+    fields with no SIMPLE iteration.  The geometry FO
+    (`openfoam_setup/_geometry_export.py`) writes Sf/V/weights/... into `0/`.
+    The log is written to `geometry.log`.
+    """
+    log_path = log_path or (of_case_dir / "geometry.log")
+    cmd = (
+        f"set -e && "
+        f"source {OPENFOAM_BASHRC} && "
+        f"cd {of_case_dir.resolve()} && "
+        f"foamPostProcess -solver incompressibleFluid -time 0"
+    )
+    LOG.info("[%s] running foamPostProcess for mesh geometry (timeout %ds)",
+             of_case_dir.name, timeout)
+    with log_path.open("w") as f:
+        proc = subprocess.run(
+            ["bash", "-c", cmd],
+            stdout=f, stderr=subprocess.STDOUT,
+            timeout=timeout, check=False,
+        )
+    LOG.info("[%s] foamPostProcess (geometry) exit %d", of_case_dir.name, proc.returncode)
+    return proc.returncode
+
+
 # ---------------------------------------------------------------------------
 # Log parsing
 # ---------------------------------------------------------------------------
