@@ -9,10 +9,25 @@ Inputs:
                  <work-dir>/of_case/
 
 Modes (mutually exclusive; default --full-run):
-  --only-residual    endTime=1 + solverInfo writeResidualFields=yes
-                     → writes per-cell initialResidual:{U,p,k,omega} to 1/
+  --only-residual    Physics-consistency check.  Evaluate the per-cell residual
+                     of every governing equation at the ML prediction.  A
+                     ``residualFields`` coded function object (see
+                     openfoam_setup/_residual_functions.py) is run via
+                     foamPostProcess — no SIMPLE iteration — writing the
+                     volScalarFields momentumResidual / continuityResidual /
+                     kResidual / omegaResidual into the case's 0/ directory.
+  --n-steps N        Solver-consistency probe.  Run N SIMPLE iterations
+                     (1-5 recommended) warm-started from the prediction and
+                     return OpenFOAM's own per-iteration residuals for
+                     Ux/Uy/p/k/omega — so you can see whether convergence
+                     starts or the solution blows up.
   --full-run         endTime=500 (with existing residualControl early-stop)
                      → standard warm-start refinement, no per-cell residuals
+
+Residual output (--only-residual only):
+  default            full per-cell residual field for each equation, returned as
+                     numpy arrays and dumped to <work-dir>/residuals.npz
+  --summary          reduce each field to scalar stats {max, mean, L2}
 
 Optional overrides (default: read from predictions.pt meta dict):
   --naca, --aoa-deg, --re
@@ -32,10 +47,16 @@ from scipy.spatial import cKDTree
 
 from physics_oracle.core.case_spec import CaseSpec, compute_inlet_conditions
 from physics_oracle.core.logging import setup_logging
+from physics_oracle.openfoam_setup._residual_functions import RESIDUAL_FIELDS
 from physics_oracle.openfoam_setup.case_setup import setup_case_with_initial_fields
-from physics_oracle.openfoam_setup.extract import _read_text, latest_time_dir, parse_internal_field
+from physics_oracle.openfoam_setup.extract import _read_text, parse_internal_field
 from physics_oracle.openfoam_setup.mesh_h5_to_polymesh import write_polymesh_from_h5
-from physics_oracle.openfoam_setup.runner import detect_convergence, parse_solver_log, run_simple_foam
+from physics_oracle.openfoam_setup.runner import (
+    detect_convergence,
+    parse_solver_log,
+    run_residual_postprocess,
+    run_simple_foam,
+)
 
 LOG = setup_logging()
 
@@ -149,89 +170,85 @@ def build_full_fields(
 # Reporting helpers
 # ---------------------------------------------------------------------------
 
-def _summary(arr: np.ndarray, name: str) -> str:
-    a = arr.ravel()
-    return (f"{name:>20s}: |r|_max={np.abs(a).max():.4e}  "
-            f"|r|_mean={np.abs(a).mean():.4e}  "
-            f"|r|_L2={np.sqrt((a * a).sum()):.4e}")
+def _reduce(arr: np.ndarray) -> dict[str, float]:
+    """Reduce a per-cell residual field to scalar summary statistics.
 
-
-def parse_residuals(of_case: Path) -> dict | None:
-    """Return the global initial residuals captured by OF13's `residuals` fo
-    as a ``{field: value}`` dict, or None if they could not be read.
-
-    OF13 Foundation does not support per-cell residual fields; what we get
-    instead is one scalar per field per iteration, written to
-    ``postProcessing/residuals/0/residuals.dat``.  For a 1-iteration
-    --only-residual run that's a single row: the initial residual of each
-    field evaluated at the ML-prediction field — i.e., how far the ML
-    prediction is from satisfying the discretised PDEs in the global L1/L2
-    sense the solver uses.
+    `median` and `p99` are included alongside `mean`/`max` because the residual
+    fields are heavy-tailed — the omega-equation residual in particular is large
+    in the near-wall band (steep omega profile), so `mean`/`max` alone are
+    misleading; `median` reflects the bulk of the field.
     """
-    pp_dir = of_case / "postProcessing" / "residuals"
-    if not pp_dir.exists():
-        LOG.warning("No postProcessing/residuals/ directory — residuals fo did not run")
-        return None
-    time_subdirs = sorted(pp_dir.iterdir(), key=lambda p: p.name)
-    if not time_subdirs:
-        LOG.warning("postProcessing/residuals/ is empty")
-        return None
-    dat_path = time_subdirs[-1] / "residuals.dat"
-    if not dat_path.exists():
-        LOG.warning("Missing %s", dat_path)
-        return None
+    a = np.abs(np.asarray(arr, dtype=np.float64).ravel())
+    return {
+        "max": float(a.max()),
+        "mean": float(a.mean()),
+        "median": float(np.median(a)),
+        "p99": float(np.percentile(a, 99)),
+        "l2": float(np.sqrt((a * a).sum())),
+    }
 
-    text = dat_path.read_text()
-    # Standard OF residuals.dat format:
-    #   # Residuals
-    #   # Time      Ux       Uy       p        k        omega
-    #   1           1.5e-3   1e-3     8e-5     3e-6     2e-6
-    header_cols: list[str] = []
-    rows: list[list[float]] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("#"):
-            header_cols = line.lstrip("#").split()
-            continue
-        parts = line.split()
+
+def parse_residuals(of_case: Path) -> dict[str, np.ndarray] | None:
+    """Read the per-cell residual volScalarFields written by the
+    ``residualFields`` coded function object (openfoam_setup/_residual_functions).
+
+    Returns ``{field: (N,) ndarray}`` for momentumResidual / continuityResidual
+    / kResidual / omegaResidual, or None if any field is missing.  The fields
+    are evaluated at the ML prediction itself — foamPostProcess writes them
+    into the case's ``0/`` directory with no SIMPLE iteration, so each value is
+    the per-cell imbalance of that discretised governing equation.
+    """
+    zero = of_case / "0"
+    out: dict[str, np.ndarray] = {}
+    for name in RESIDUAL_FIELDS:
         try:
-            rows.append([float(x) for x in parts])
-        except ValueError:
-            continue
-    if not rows:
-        LOG.warning("No residual rows parsed from %s", dat_path)
-        return None
-    last = rows[-1]
-    if header_cols and len(header_cols) >= len(last):
-        names = header_cols[: len(last)]
-    else:
-        names = [f"col{i}" for i in range(len(last))]
-    return {name: val for name, val in zip(names, last)}
+            arr = parse_internal_field(_read_text(zero / name))
+        except (FileNotFoundError, ValueError) as exc:
+            LOG.warning("Could not read residual field %s/%s: %s", zero, name, exc)
+            return None
+        out[name] = np.asarray(arr, dtype=np.float64).ravel()
+    return out
 
 
-def report_residuals(residuals: dict | None) -> None:
-    """Pretty-print a residual dict from parse_residuals."""
+def report_residuals(residuals: dict | None, mode: str) -> None:
+    """Pretty-print residuals from `run_step`.
+
+    `mode` is ``"spatial"`` (values are per-cell ndarrays) or ``"summary"``
+    (values are ``{max, mean, l2}`` dicts).
+    """
     if residuals is None:
         print("No residuals captured.")
         return
-    print("Initial residuals at this iteration (global, scalar per field):")
-    for name, val in residuals.items():
-        print(f"  {name:>10s}: {val:.4e}")
-    print()
-    print("NOTE: OF13 Foundation does not emit per-cell residual volScalarFields.")
-    print("      Per-cell spatial residuals require custom postprocessing or ESI OF.")
+    if mode == "spatial":
+        print("Per-cell residual fields (|r| summarised over cells):")
+        for name, arr in residuals.items():
+            s = _reduce(arr)
+            print(f"  {name:>20s}: n={arr.size}  median={s['median']:.4e}  "
+                  f"p99={s['p99']:.4e}  mean={s['mean']:.4e}  max={s['max']:.4e}")
+        print("  (wall-function cells masked to 0; near-wall omegaResidual is "
+              "large by nature — prefer median.)")
+    else:
+        print("Residual summary (per-cell field reduced to scalars):")
+        for name, s in residuals.items():
+            print(f"  {name:>20s}: median={s['median']:.4e}  p99={s['p99']:.4e}  "
+                  f"mean={s['mean']:.4e}  max={s['max']:.4e}  L2={s['l2']:.4e}")
 
 
 def parse_convergence(of_case: Path) -> dict:
-    """Parse the solver log into a convergence-summary dict."""
+    """Parse the solver log into a convergence-summary dict.
+
+    ``history`` holds OpenFOAM's per-iteration initial residuals as
+    ``{field: [r_1, r_2, ...]}`` for Ux/Uy/p/k/omega — the array used by the
+    --n-steps probe to show whether convergence starts.
+    """
     log_path = of_case / "simpleFoam.log"
     text = log_path.read_text(errors="replace") if log_path.exists() else ""
     parsed = parse_solver_log(text)
     conv = detect_convergence(parsed["history"])
     return {
         "n_iter": parsed["n_iter"],
+        "fields": parsed["fields"],
+        "history": parsed["history"],
         "final_residuals": parsed["final"],
         "orders_dropped": conv["drops"],
         "converged": conv["overall"],
@@ -244,6 +261,43 @@ def report_convergence(convergence: dict) -> None:
     print(f"Final residuals: {convergence['final_residuals']}")
     print(f"Orders dropped: {convergence['orders_dropped']}")
     print(f"Converged (all fields ≥ 4 orders): {convergence['converged']}")
+
+
+def report_iterations(convergence: dict) -> None:
+    """Pretty-print the per-iteration residual array from an --n-steps probe."""
+    fields = convergence["fields"]
+    history = convergence["history"]
+    n = convergence["n_iter"]
+    if n == 0:
+        print("No iterations parsed from the solver log.")
+        return
+    print(f"Per-iteration initial residuals ({n} SIMPLE step(s)):")
+    print("  iter  " + "  ".join(f"{f:>11s}" for f in fields))
+    for i in range(n):
+        row = "  ".join(f"{history[f][i]:11.4e}" for f in fields)
+        print(f"  {i + 1:>4d}  {row}")
+
+    # Verdict over the probe window.  Distinguish a genuine blow-up (huge or
+    # NaN residuals) from residuals merely rising while still bounded — the
+    # latter is often just a start-up transient and needs more steps to call.
+    print()
+    last = [history[f][-1] for f in fields]
+    decreasing = []
+    for f in fields:
+        vals = [v for v in history[f] if v == v]  # drop NaN
+        if len(vals) >= 2 and vals[0] > 0:
+            decreasing.append(vals[-1] < vals[0])
+    if any((v != v) or v > 1.0e3 for v in last):
+        print("Verdict: residuals exploded (huge / NaN) — the prediction is "
+              "outside the solver's stable basin.")
+    elif decreasing and all(decreasing):
+        print("Verdict: all residuals decreasing — convergence is starting.")
+    elif decreasing and not any(decreasing):
+        print("Verdict: residuals rising but still bounded — not yet "
+              "converging; run more steps to tell a start-up transient from "
+              "real divergence.")
+    else:
+        print("Verdict: mixed — inspect the per-field columns above.")
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +317,15 @@ def parse_args() -> argparse.Namespace:
                    help="Reynolds number (default: meta['reynolds'])")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--only-residual", action="store_true",
-                      help="Run 1 SIMPLE iter and capture spatial residuals")
+                      help="0-step: evaluate per-cell residual fields at the ML prediction")
+    mode.add_argument("--n-steps", type=int, metavar="N", default=None,
+                      help="N-step probe: run N SIMPLE iterations (1-5 recommended) "
+                           "and report OpenFOAM's per-iteration residuals")
     mode.add_argument("--full-run", action="store_true",
                       help="Run 500 SIMPLE iters with standard convergence criteria (default)")
+    p.add_argument("--summary", action="store_true",
+                   help="--only-residual: reduce each residual field to scalar "
+                        "{max,mean,L2} instead of returning the full per-cell field")
     p.add_argument("--clean", action="store_true",
                    help="Delete --work-dir before starting")
     return p.parse_args()
@@ -275,10 +335,11 @@ def parse_args() -> argparse.Namespace:
 class StepResult:
     """Result of one OpenFOAM warm-start step."""
     of_case_dir: Path
-    mode: str                       # "only-residual" | "full-run"
+    mode: str                       # "only-residual" | "n-step" | "full-run"
     exit_code: int
-    residuals: dict | None          # {field: scalar}  — only-residual mode
-    convergence: dict | None        # parsed log info  — full-run mode
+    residuals: dict | None          # only-residual mode (see residual_mode)
+    convergence: dict | None        # parsed log info — n-step and full-run modes
+    residual_mode: str | None = None  # "spatial" | "summary" — only-residual mode
 
 
 def run_step(
@@ -291,26 +352,41 @@ def run_step(
     aoa_deg: float | None = None,
     re: float | None = None,
     clean: bool = False,
+    spatial_residuals: bool = True,
+    n_steps: int = 1,
 ) -> StepResult:
     """Run one OpenFOAM step warm-started from an ML prediction.
 
     Loads `prediction` (a predictions.pt), matches it to the mesh in
     `mesh_h5`, writes an OpenFOAM case under `work_dir/of_case/` with the
     prediction as the initial field (freestream outside the prediction's
-    bounding box), runs foamRun, and returns a `StepResult`.
+    bounding box), and returns a `StepResult`.
 
     Parameters
     ----------
     mode
-        ``"only-residual"`` — endTime=1, returns global initial residuals.
-        ``"full-run"``       — endTime=500, returns convergence info.
+        ``"only-residual"`` — evaluate per-cell residual fields at the ML
+        prediction via foamPostProcess (no SIMPLE iteration).
+        ``"n-step"``         — run `n_steps` SIMPLE iterations and return
+        OpenFOAM's per-iteration residuals in ``StepResult.convergence``.
+        ``"full-run"``       — endTime=500 SIMPLE run, returns convergence info.
     naca, aoa_deg, re
         Override the values read from the prediction's `meta` dict.
     clean
         Delete `work_dir` before starting.
+    spatial_residuals
+        Only-residual mode.  If True (default), ``StepResult.residuals`` holds
+        the full per-cell residual field for each equation as ``(N,) ndarray``s
+        (``residual_mode == "spatial"``).  If False, each field is reduced to a
+        ``{max, mean, l2}`` dict (``residual_mode == "summary"``).
+    n_steps
+        n-step mode only.  Number of SIMPLE iterations to run (1-5 recommended).
     """
-    if mode not in ("only-residual", "full-run"):
-        raise ValueError(f"mode must be 'only-residual' or 'full-run', got {mode!r}")
+    if mode not in ("only-residual", "n-step", "full-run"):
+        raise ValueError(
+            f"mode must be 'only-residual', 'n-step' or 'full-run', got {mode!r}")
+    if mode == "n-step" and n_steps < 1:
+        raise ValueError(f"n_steps must be >= 1, got {n_steps}")
     prediction, mesh_h5, work_dir = Path(prediction), Path(mesh_h5), Path(work_dir)
 
     if clean and work_dir.exists():
@@ -362,31 +438,55 @@ def run_step(
 
     # ----- setup case + run -----
     only_residual = mode == "only-residual"
-    end_time = 1 if only_residual else 500
+    if only_residual:
+        end_time = 1
+    elif mode == "n-step":
+        end_time = n_steps
+    else:
+        end_time = 500
     setup_case_with_initial_fields(
         of_case, spec, fields,
         end_time=end_time,
         enable_residual_capture=only_residual,
     )
 
-    LOG.info("Running foamRun (endTime=%d, mode=%s)", end_time, mode)
-    rc = run_simple_foam(of_case)
-    LOG.info("foamRun exit code: %d", rc)
+    residuals: dict | None = None
+    convergence: dict | None = None
+    residual_mode: str | None = None
+    if only_residual:
+        LOG.info("Evaluating per-cell residual fields via foamPostProcess")
+        rc = run_residual_postprocess(of_case)
+        LOG.info("foamPostProcess exit code: %d", rc)
+        per_cell = parse_residuals(of_case)
+        if per_cell is None or spatial_residuals:
+            residuals, residual_mode = per_cell, "spatial"
+        else:
+            residuals = {n: _reduce(a) for n, a in per_cell.items()}
+            residual_mode = "summary"
+    else:
+        LOG.info("Running foamRun (endTime=%d, mode=%s)", end_time, mode)
+        rc = run_simple_foam(of_case)
+        LOG.info("foamRun exit code: %d", rc)
+        convergence = parse_convergence(of_case)
 
-    residuals = parse_residuals(of_case) if only_residual else None
-    convergence = parse_convergence(of_case) if not only_residual else None
     return StepResult(
         of_case_dir=of_case,
         mode=mode,
         exit_code=rc,
         residuals=residuals,
         convergence=convergence,
+        residual_mode=residual_mode,
     )
 
 
 def main() -> None:
     args = parse_args()
-    mode = "only-residual" if args.only_residual else "full-run"
+    if args.only_residual:
+        mode = "only-residual"
+    elif args.n_steps is not None:
+        mode = "n-step"
+    else:
+        mode = "full-run"
     try:
         result = run_step(
             prediction=args.prediction,
@@ -397,12 +497,28 @@ def main() -> None:
             aoa_deg=args.aoa_deg,
             re=args.re,
             clean=args.clean,
+            spatial_residuals=not args.summary,
+            n_steps=args.n_steps if args.n_steps is not None else 1,
         )
     except (ValueError, FileNotFoundError) as exc:
         sys.exit(str(exc))
 
     if result.mode == "only-residual":
-        report_residuals(result.residuals)
+        report_residuals(result.residuals, result.residual_mode or "spatial")
+        if result.residual_mode == "spatial" and result.residuals is not None:
+            npz_path = args.work_dir / "residuals.npz"
+            np.savez(npz_path, **result.residuals)
+            print()
+            print(f"Per-cell residual arrays written to {npz_path}")
+            print(f"OpenFOAM residual volScalarFields under {result.of_case_dir / '0'}")
+    elif result.mode == "n-step":
+        report_iterations(result.convergence)
+        hist = result.convergence["history"]
+        npz_path = args.work_dir / "iteration_residuals.npz"
+        np.savez(npz_path, **{f: np.asarray(v, dtype=np.float64)
+                              for f, v in hist.items()})
+        print()
+        print(f"Per-iteration residual arrays written to {npz_path}")
     else:
         report_convergence(result.convergence)
 

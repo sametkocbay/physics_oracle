@@ -46,6 +46,39 @@ def run_simple_foam(of_case_dir: Path, log_path: Path | None = None,
     return proc.returncode
 
 
+def run_residual_postprocess(of_case_dir: Path, log_path: Path | None = None,
+                             timeout: int = 60 * 30) -> int:
+    """Evaluate the ``residualFields`` coded function object on the ``0/`` ML
+    fields without running the solver.  Returns the exit code.
+
+    The case must have been written with
+    ``setup_case_with_initial_fields(enable_residual_capture=True)`` so that
+    controlDict carries the coded FO.  ``foamPostProcess -solver
+    incompressibleFluid -time 0`` constructs the incompressible solver in
+    post-processing mode (loading U/p/k/omega/nut), executes the controlDict
+    functions, and the FO writes the per-cell residual volScalarFields into
+    ``0/``.  No SIMPLE iteration runs, so the residual is measured exactly at
+    the ML prediction.  The log is written to ``residuals.log``.
+    """
+    log_path = log_path or (of_case_dir / "residuals.log")
+    cmd = (
+        f"set -e && "
+        f"source {OPENFOAM_BASHRC} && "
+        f"cd {of_case_dir.resolve()} && "
+        f"foamPostProcess -solver incompressibleFluid -time 0"
+    )
+    LOG.info("[%s] running foamPostProcess (timeout %ds) — log %s",
+             of_case_dir.name, timeout, log_path.name)
+    with log_path.open("w") as f:
+        proc = subprocess.run(
+            ["bash", "-c", cmd],
+            stdout=f, stderr=subprocess.STDOUT,
+            timeout=timeout, check=False,
+        )
+    LOG.info("[%s] foamPostProcess exit %d", of_case_dir.name, proc.returncode)
+    return proc.returncode
+
+
 # ---------------------------------------------------------------------------
 # Log parsing
 # ---------------------------------------------------------------------------

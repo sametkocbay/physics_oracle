@@ -24,7 +24,7 @@ from physics_oracle.core.case_spec import CaseSpec, parse_case_id
 from physics_oracle.core.logging import setup_logging
 from physics_oracle.core.paths import OPENFOAM_CONFIG_PATH
 
-from ._residual_functions import SOLVER_INFO_BLOCK
+from ._residual_functions import RESIDUAL_FO_BLOCK
 from .of_writer import (
     render_foam_dict,
     render_nonuniform_scalar,
@@ -79,6 +79,7 @@ def _per_case_mapping(spec: CaseSpec, end_time: int, write_interval: int) -> dic
         "__DRAG_Y__":  _format_num(math.sin(aoa_rad)),
         "__END_TIME__":      str(end_time),
         "__WRITE_INTERVAL__": str(write_interval),
+        "__NU__":      _format_num(float(_load_config()["physical"]["nu"])),
     }
 
 
@@ -229,9 +230,13 @@ def setup_case_with_initial_fields(
     end_time
         Solver endTime (1 for residual-only mode, ~500 for a warm-start run).
     enable_residual_capture
-        If True, splice a ``solverInfo`` function object into controlDict so
-        the run writes per-cell ``initialResidual:U``, ``initialResidual:p``,
-        ``initialResidual:k``, ``initialResidual:omega`` volScalarFields.
+        If True, replace controlDict's ``functions`` with the single
+        ``residualFields`` coded function object (see ``_residual_functions``),
+        which writes per-cell ``momentumResidual``, ``continuityResidual``,
+        ``kResidual`` and ``omegaResidual`` volScalarFields.  The forceCoeffs /
+        yPlus / residuals objects are dropped — they are not needed for a
+        residual-only evaluation (and yPlus needs a constructed turbulence
+        model).  Evaluate the case with ``runner.run_residual_postprocess``.
     write_interval
         controlDict writeInterval.  Defaults to `end_time` (write once at the
         end), which is what both residual-only and short warm-start runs want.
@@ -242,10 +247,13 @@ def setup_case_with_initial_fields(
     cfg = copy.deepcopy(_load_config())
     mapping = _per_case_mapping(spec, end_time, write_interval)
 
-    if enable_residual_capture and SOLVER_INFO_BLOCK:
-        cfg["control_dict"]["functions"]["solverInfo"] = copy.deepcopy(SOLVER_INFO_BLOCK)
-    # else: the standard ``residuals`` block already in configs/openfoam.yaml
-    # captures scalar per-iteration residuals to postProcessing/residuals/.
+    if enable_residual_capture:
+        # Residual-only evaluation: the coded FO is the sole function object.
+        cfg["control_dict"]["functions"] = {
+            "residualFields": copy.deepcopy(RESIDUAL_FO_BLOCK)
+        }
+    # else: keep the standard forceCoeffs / residuals / yPlus blocks from
+    # configs/openfoam.yaml for a normal warm-start run.
 
     write_zero_dir_with_fields(of_case_dir / "0", spec, cfg, mapping, fields)
     write_constant_dir(of_case_dir / "constant", cfg)
