@@ -6,9 +6,11 @@ that wraps an OpenFOAM 2D airfoil pipeline. It does three things:
 
 - **Dataset generation** — sample NACA profiles, mesh, solve, extract, and
   export an ML-ready dataset (`physics-oracle-generate`, `physics-oracle-build-ml`).
-- **ML warm-start** — take an ML-predicted flow field, run an OpenFOAM step
-  initialized from it, and report residuals (`physics-oracle-run-step` /
-  `from physics_oracle import run_step`).
+- **ML warm-start & residual evaluation** — take an ML-predicted flow field and
+  either measure its per-cell physics residual (computed in OpenFOAM, or in a
+  differentiable PyTorch reimplementation), probe how the solver reacts over
+  N iterations, or run it to convergence (`physics-oracle-run-step` /
+  `from physics_oracle import run_step`). See §10.
 - **Reusable building blocks** — NACA geometry, meshing, OpenFOAM case setup,
   field extraction, and `mesh.h5 → polyMesh` conversion, all importable under
   the `physics_oracle.*` namespace.
@@ -357,7 +359,78 @@ result = run_step(prediction, mesh_h5, work_dir, mode="only-residual")
 
 ---
 
-## 10. Full Directory Layout
+## 10. ML Warm-Start: Residual Evaluation & Solver Probing
+
+`physics-oracle-run-step` (`physics_oracle.run_step`) takes an ML-predicted flow
+field (a `predictions.pt` with `pos`, `target`, `meta`) on a saved `mesh.h5` and
+evaluates it. Four mutually-exclusive modes:
+
+| Mode | What it does | Output |
+|------|--------------|--------|
+| `--only-residual` | **0-step physics check.** Per-cell residual of the momentum, continuity, k and omega equations *at the prediction* — evaluated by an OpenFOAM `coded` function object run through `foamPostProcess` (no SIMPLE iteration). | per-cell fields → `residuals.npz` + volScalarFields in `of_case/0/` |
+| `--only-residual-diff` | The **same residual, recomputed in PyTorch** — no OpenFOAM solve, differentiable end-to-end. | per-cell fields → `residuals_diff.npz` |
+| `--n-steps N` | **Solver-consistency probe.** Run N SIMPLE iterations (1–5 recommended) warm-started from the prediction; report OpenFOAM's per-iteration residuals — does convergence start, or does it diverge? | per-iteration array → `iteration_residuals.npz` |
+| `--full-run` | Standard warm-started refinement to convergence (endTime 500). | convergence summary |
+
+`--summary` (with either `--only-residual` mode) reduces each per-cell field to
+scalar stats `{median, p99, mean, max, L2}` instead of the full field.
+
+The four residual fields are `momentumResidual`, `continuityResidual`,
+`kResidual`, `omegaResidual`. Cells adjacent to the airfoil carry wall functions
+that override the transport equations, so they are masked to zero. The omega
+residual is large by nature in the near-wall band (steep omega profile) — read
+its **median**, not mean/max.
+
+### Differentiable residual (`physics_oracle.residual_diff`)
+
+`--only-residual` runs inside a separate OpenFOAM process — accurate, but a black
+box to autograd. `residual_diff` reimplements the identical finite-volume
+residual in **PyTorch**, so gradients flow from a prediction tensor back to the
+residual (usable as a physics-informed training loss):
+
+- Mesh geometry (face-area vectors, cell volumes, interpolation weights,
+  non-orthogonal correction vectors, wall distance) is exported **once** from
+  OpenFOAM and cached next to `mesh.h5` as `<mesh>.geom.pt`; later calls need no
+  OpenFOAM at all.
+- The FVM operators reproduce the case's `fvSchemes` — linear / upwind /
+  `linearUpwindV` interpolation, `Gauss` and `cellLimited` gradients, `bounded`
+  divergence, `corrected` laplacian — plus the explicit kOmegaSST source terms.
+- It matches the OpenFOAM coded-FO residual to **correlation 1.0** (field-L2
+  ≤ 0.2 %) on realistic predictions.
+
+```python
+from physics_oracle.residual_diff import export_mesh_geometry, DifferentiableResidual
+
+geom  = export_mesh_geometry(mesh_h5, work_dir, spec)   # one-time, then cached
+model = DifferentiableResidual(geom, nu, inlet)
+res   = model(U, p, k, omega, nut)                      # autograd-friendly tensors
+loss  = res["momentumResidual"].pow(2).mean() + res["continuityResidual"].pow(2).mean()
+loss.backward()                                         # gradients reach U, p, k, …
+```
+
+### CLI examples
+
+```bash
+# 0-step per-cell physics residual at the prediction (OpenFOAM coded FO)
+uv run physics-oracle-run-step --prediction predictions.pt \
+    --mesh NACA2412_p5.0_3.0e5_mesh.h5 --work-dir /tmp/run01 --only-residual
+
+# Same residual, differentiable (PyTorch, no OpenFOAM solve)
+uv run physics-oracle-run-step --prediction predictions.pt \
+    --mesh NACA2412_p5.0_3.0e5_mesh.h5 --work-dir /tmp/run01 --only-residual-diff
+
+# Solver-consistency probe — 3 SIMPLE iterations
+uv run physics-oracle-run-step --prediction predictions.pt \
+    --mesh NACA2412_p5.0_3.0e5_mesh.h5 --work-dir /tmp/run01 --n-steps 3
+```
+
+Rough per-input cost (≈57k-cell mesh): `--only-residual` ~30 s (runs OpenFOAM
+every call); `--only-residual-diff` ~3 s once geometry is cached (the residual
+itself is sub-second); `--n-steps 3` ~10 s.
+
+---
+
+## 11. Full Directory Layout
 
 ```
 physics_oracle/
@@ -373,10 +446,13 @@ physics_oracle/
         ├── geometry/                       # NACA math + LHS sampling
         ├── meshing/                        # Gmsh unstructured + structured C-mesh
         ├── openfoam_setup/                 # case_setup, of_writer, runner, extract, qc,
-        │                                   #   mesh_h5_to_polymesh
+        │                                   #   mesh_h5_to_polymesh, _residual_functions,
+        │                                   #   _geometry_export
+        ├── residual_diff/                  # differentiable PyTorch residual:
+        │                                   #   geometry, operators, boundary, residual
         ├── utils/                          # visualize_npz
         └── cli/                            # generate_dataset, build_ml_dataset,
-                                            #   run_ml_initialized_step
+                                            #   run_ml_initialized_step (4 residual modes)
 ```
 
 Runtime outputs (gitignored) land under `<cwd>/dataset/` — or
@@ -395,7 +471,7 @@ dataset/
 
 ---
 
-## 11. Reproducibility Checklist
+## 12. Reproducibility Checklist
 
 - [ ] OpenFOAM v13 Foundation installed and sourced (`/opt/openfoam13/etc/bashrc`)
 - [ ] `uv sync` ran cleanly; `.venv/` matches `uv.lock`
