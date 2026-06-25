@@ -16,6 +16,7 @@ dependencies = [
 [project.scripts]
 physics-oracle-generate = "physics_oracle.cli.generate_dataset:main"
 physics-oracle-build-ml = "physics_oracle.cli.build_ml_dataset:main"
+physics-oracle-correct-sdf = "physics_oracle.cli.correct_sdf:main"
 physics-oracle-run-step = "physics_oracle.cli.run_ml_initialized_step:main"
 
 [build-system]

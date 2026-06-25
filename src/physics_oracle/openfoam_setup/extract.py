@@ -21,10 +21,10 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-from scipy.spatial import cKDTree
 
 from physics_oracle.core.case_spec import parse_case_id
 from physics_oracle.core.logging import setup_logging
+from physics_oracle.geometry.distance import naca_surface_distance
 from physics_oracle.geometry.naca import naca4_coordinates
 from physics_oracle.openfoam_setup.runner import detect_convergence, parse_solver_log
 
@@ -480,11 +480,11 @@ def extract_case(of_case_dir: Path, case_dir: Path, case_id: str) -> dict:
     airfoil_coords = naca4_coordinates(parsed["naca_code"], n_points=200)
 
     # ---- wall distance ----
-    wall_tree = cKDTree(airfoil_xy_unsorted) if len(airfoil_xy_unsorted) else None
-    if wall_tree is not None:
-        wall_distance, _ = wall_tree.query(cell_centers2)
-    else:
-        wall_distance = np.full(n_cells, np.nan)
+    # Exact distance from each cell centre to the analytic NACA surface.  This
+    # replaces the old nearest-*vertex* KD-tree query against the faceted mesh
+    # boundary, which over-estimated the true wall distance (point-to-vertex
+    # instead of point-to-surface).  See geometry/distance.py.
+    wall_distance = naca_surface_distance(cell_centers2, parsed["naca_code"])
 
     # ---- y+ ----  written by the yPlus function object as a volScalarField
     #               whose boundaryField on `airfoilWalls` carries the wall values.
