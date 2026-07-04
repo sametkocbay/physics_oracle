@@ -14,6 +14,8 @@ from .envelope import (
     ENVELOPE,
     MESH_VERSION,
     NU,
+    OOD_BUCKET_WEIGHTS,
+    OOD_ENVELOPE,
     OPENFOAM_VERSION,
     TURB_INTENSITY,
     TURB_LENGTH_FRAC,

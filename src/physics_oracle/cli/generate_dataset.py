@@ -39,6 +39,7 @@ from physics_oracle.core import (
     MANIFEST_PATH,
     MESH_VERSION,
     NU,
+    OOD_ENVELOPE,
     OPENFOAM_CONFIG_PATH,
     OPENFOAM_VERSION,
     SPLITS_DIR,
@@ -47,10 +48,12 @@ from physics_oracle.core import (
 )
 from physics_oracle.geometry.sampling import (
     assign_splits,
+    collect_existing_codes,
     sample_cases,
     sample_fill_cases,
     sample_naca_profiles,
     sample_ood_cases,
+    sample_ood_set,
 )
 from physics_oracle.meshing import generate_c_mesh, generate_mesh
 from physics_oracle.openfoam_setup import (
@@ -304,6 +307,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fill", action="store_true",
                    help="Fill mode: scan cases/ and splits/ for already-run cases, then "
                         "sample only new cases until --n-cases accepted cases exist.")
+    p.add_argument("--ood-fill", action="store_true",
+                   help="OOD mode: sample atypical-geometry / high-AoA cases (split='ood') "
+                        "and run until --n-ood accepted cases exist. Re stays mesh-valid.")
+    p.add_argument("--ood-oversample", type=int, default=3,
+                   help="Candidates drawn per requested OOD case (high-AoA cases reject "
+                        "more often, so a buffer is needed). Default 3.")
+    p.add_argument("--aoa-range", "--aoa_range", dest="aoa_range", nargs=2,
+                   type=float, metavar=("MIN", "MAX"), default=None,
+                   help="Override the OOD |AoA| band (degrees), e.g. --aoa-range 12 15 "
+                        "for a stricter high-angle probe. Sign is still randomised +/-. "
+                        "Only affects --ood-fill; default keeps the 6-12 deg envelope.")
+    p.add_argument("--re-range", "--re_range", dest="re_range", nargs=2,
+                   type=float, metavar=("MIN", "MAX"), default=None,
+                   help="Override the OOD Reynolds band, e.g. --re-range 1e6 3e6 to push "
+                        "above the trained/mesh-valid 1e5-5e5. NOTE: first-cell height is "
+                        "fixed, so higher Re raises y+ past wall-function validity and QC "
+                        "may reject cases. Only affects --ood-fill.")
+    p.add_argument("--exclude-existing", nargs="*", default=[],
+                   help="Dataset roots whose NACA profiles must NOT be reused by --ood-fill "
+                        "(e.g. the in-domain ML dataset and raw OpenFOAM dataset).")
     return p.parse_args()
 
 
@@ -351,11 +374,81 @@ def _run_cases_serial(all_cases: list[CaseSpec], args: argparse.Namespace,
     return n_accepted, n_rejected, cases_run
 
 
+def _run_ood_fill(args: argparse.Namespace) -> None:
+    """Sample + run OOD cases (split='ood') until --n-ood accepted exist.
+
+    OOD cases live in their own DATASET_ROOT (set PHYSICS_ORACLE_DATASET_ROOT)
+    so they never mix with the in-domain cases. Geometries already present in
+    --exclude-existing roots are never reused.
+    """
+    solver_hash = solver_settings_hash()
+    t0 = time.time()
+
+    if args.aoa_range is not None:
+        lo, hi = args.aoa_range
+        if lo <= 0 or hi <= 0 or hi <= lo:
+            raise SystemExit(
+                f"--aoa-range needs 0 < MIN < MAX (got {lo} {hi}); values are "
+                "|AoA| magnitudes in degrees, sign is randomised at sampling.")
+        OOD_ENVELOPE["aoa_abs_min_deg"] = lo
+        OOD_ENVELOPE["aoa_abs_max_deg"] = hi
+        LOG.info("OOD |AoA| band overridden to [%.1f, %.1f] deg via --aoa-range", lo, hi)
+
+    if args.re_range is not None:
+        re_lo, re_hi = args.re_range
+        if re_lo <= 0 or re_hi <= 0 or re_hi <= re_lo:
+            raise SystemExit(
+                f"--re-range needs 0 < MIN < MAX (got {re_lo} {re_hi}).")
+        OOD_ENVELOPE["re_min"] = re_lo
+        OOD_ENVELOPE["re_max"] = re_hi
+        LOG.info("OOD Reynolds band overridden to [%.3g, %.3g] via --re-range", re_lo, re_hi)
+        if re_hi > ENVELOPE["re_max"]:
+            LOG.warning("OOD re_max %.3g exceeds the mesh-valid trained band (%.3g); "
+                        "y+ may leave wall-function validity and QC could reject cases.",
+                        re_hi, ENVELOPE["re_max"])
+
+    existing_tried, existing_accepted = get_existing_cases()
+    exclude_ids = existing_tried | get_split_case_ids()
+    exclude_codes = collect_existing_codes(*args.exclude_existing)
+    LOG.info("OOD fill: %d accepted on disk, %d profiles excluded as already-seen",
+             len(existing_accepted), len(exclude_codes))
+
+    n_more = args.n_ood - len(existing_accepted)
+    if n_more <= 0:
+        LOG.info("OOD target of %d already reached. Nothing to do.", args.n_ood)
+        return
+
+    candidates = sample_ood_set(n_more, exclude_codes, exclude_ids,
+                                args.seed, oversample=args.ood_oversample)
+
+    if args.workers > 1:
+        # Parallel path runs the whole pool; the build step caps output at n_ood.
+        n_accepted, n_rejected = _run_cases_parallel(candidates, args, solver_hash)
+        cases_run = candidates
+    else:
+        n_accepted, n_rejected, cases_run = _run_cases_serial(
+            candidates, args, solver_hash, stop_after_accepted=n_more)
+
+    append_to_splits(cases_run)
+
+    total_accepted = len(existing_accepted) + n_accepted
+    LOG.info("OOD fill done: +%d accepted, +%d rejected in %.1f s (total accepted %d / %d)",
+             n_accepted, n_rejected, time.time() - t0, total_accepted, args.n_ood)
+    if total_accepted < args.n_ood:
+        LOG.warning("Still %d short of %d OOD cases — re-run ./generate_ood with a "
+                    "different --seed to draw more candidates.",
+                    args.n_ood - total_accepted, args.n_ood)
+
+
 def main() -> None:
     args = parse_args()
     DATASET_ROOT.mkdir(parents=True, exist_ok=True)
     CASES_DIR.mkdir(parents=True, exist_ok=True)
     SPLITS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.ood_fill:
+        _run_ood_fill(args)
+        return
 
     LOG.info("§2.1  sampling %d unique NACA profiles (seed=%d)",
              args.n_profiles, args.seed)

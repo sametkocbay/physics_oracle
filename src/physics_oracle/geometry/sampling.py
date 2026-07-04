@@ -6,17 +6,21 @@ sampling logic lives in one place under src/geometry/.
 from __future__ import annotations
 
 import math
+import re
+from pathlib import Path
 
 import numpy as np
 from scipy.stats import qmc
 
 from physics_oracle.core.case_spec import CaseSpec
-from physics_oracle.core.envelope import ENVELOPE
+from physics_oracle.core.envelope import ENVELOPE, OOD_BUCKET_WEIGHTS, OOD_ENVELOPE
 from physics_oracle.core.logging import setup_logging
 
 from .naca import naca4_code
 
 LOG = setup_logging()
+
+_CODE_RE = re.compile(r"NACA(\d{4})")
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +171,112 @@ def sample_ood_cases(profiles: list[dict], n_ood: int, seed: int) -> list[CaseSp
             seen.add(c.case_id)
             out.append(c)
     return out
+
+
+# ---------------------------------------------------------------------------
+# OOD test-set sampling (atypical geometry + high |AoA|, mesh-valid Re)
+# ---------------------------------------------------------------------------
+
+def collect_existing_codes(*roots: "str | Path") -> set[str]:
+    """Collect every 4-digit NACA code already present under ``roots``.
+
+    Scans the top level of each root (case-id directories, as in the raw
+    OpenFOAM dataset) plus one level of split subfolders (``train/`` ``val/``
+    ``test/`` ``ood/`` of the ML dataset, whose ``.npz`` files are named after
+    the case id).  Used so the OOD sampler only proposes geometries that are
+    not already in the dataset.
+    """
+    codes: set[str] = set()
+
+    def _scan(d: Path) -> None:
+        try:
+            entries = list(d.iterdir())
+        except (PermissionError, NotADirectoryError, FileNotFoundError):
+            return
+        for entry in entries:
+            m = _CODE_RE.search(entry.name)
+            if m:
+                codes.add(m.group(1))
+
+    for root in roots:
+        root = Path(root)
+        if not root.exists():
+            continue
+        _scan(root)
+        for sub in root.iterdir():
+            if sub.is_dir() and not _CODE_RE.search(sub.name):
+                _scan(sub)
+    return codes
+
+
+_BUCKET_RANGES = {
+    "thin": ("thin_thickness_pct", (ENVELOPE["camber_pct_min"], ENVELOPE["camber_pct_max"])),
+    "thick": ("thick_thickness_pct", (ENVELOPE["camber_pct_min"], ENVELOPE["camber_pct_max"])),
+    "high_camber": ("thickness_in_domain", OOD_ENVELOPE["high_camber_pct"]),
+}
+
+
+def _sample_ood_bucket(name: str, n: int, exclude_codes: set[str],
+                       seen_ids: set[str], rng: np.random.Generator) -> list[CaseSpec]:
+    """Draw ``n`` OOD candidate cases for one atypical-geometry family."""
+    thickness_key, camber_range = _BUCKET_RANGES[name]
+    if thickness_key == "thickness_in_domain":
+        t_lo, t_hi = ENVELOPE["thickness_pct_min"], ENVELOPE["thickness_pct_max"]
+    else:
+        t_lo, t_hi = OOD_ENVELOPE[thickness_key]
+    c_lo, c_hi = camber_range
+    p_lo, p_hi = OOD_ENVELOPE["camber_pos_pct"]
+    a_lo, a_hi = OOD_ENVELOPE["aoa_abs_min_deg"], OOD_ENVELOPE["aoa_abs_max_deg"]
+    log_re_lo = math.log10(OOD_ENVELOPE["re_min"])
+    log_re_hi = math.log10(OOD_ENVELOPE["re_max"])
+
+    out: list[CaseSpec] = []
+    attempts = 0
+    while len(out) < n and attempts < n * 200 + 200:
+        attempts += 1
+        thickness = rng.uniform(t_lo, t_hi)
+        camber = rng.uniform(c_lo, c_hi)
+        position = rng.uniform(p_lo, p_hi)
+        code = naca4_code(camber, position, thickness)
+        if code in exclude_codes:
+            continue  # geometry must not already be in the dataset
+        aoa = round(float(rng.uniform(a_lo, a_hi)) * rng.choice([-1.0, 1.0]), 1)
+        re_val = float(10 ** rng.uniform(log_re_lo, log_re_hi))
+        spec = CaseSpec.build(code, aoa, re_val, "ood")
+        if spec.case_id in seen_ids:
+            continue
+        seen_ids.add(spec.case_id)
+        out.append(spec)
+    if len(out) < n:
+        LOG.warning("OOD bucket %r: only %d/%d candidates after %d attempts",
+                    name, len(out), n, attempts)
+    return out
+
+
+def sample_ood_set(n_target: int, exclude_codes: set[str], exclude_ids: set[str],
+                   seed: int, oversample: int = 3) -> list[CaseSpec]:
+    """Sample an oversampled pool of OOD candidate cases (split='ood').
+
+    OOD-ness comes from atypical geometry (thin / thick / strongly cambered
+    sections absent from the trained set) combined with |AoA| beyond the
+    trained +/-5 deg, which drives |Cl| past anything in-domain.  Reynolds is
+    held inside the mesh-valid band.  ``oversample`` cases per target are
+    drawn so the caller can keep running until ``n_target`` converge.
+    """
+    rng = np.random.default_rng(seed + 7)
+    n_pool = max(n_target * max(1, oversample), n_target + 8)
+
+    total_w = sum(OOD_BUCKET_WEIGHTS.values())
+    seen_ids = set(exclude_ids)
+    cases: list[CaseSpec] = []
+    for name, weight in OOD_BUCKET_WEIGHTS.items():
+        n_bucket = max(1, int(round(n_pool * weight / total_w)))
+        cases.extend(_sample_ood_bucket(name, n_bucket, exclude_codes, seen_ids, rng))
+
+    rng.shuffle(cases)
+    LOG.info("Sampled %d OOD candidates (target %d accepted, oversample x%d)",
+             len(cases), n_target, oversample)
+    return cases
 
 
 def sample_fill_cases(profiles: list[dict], splits: dict[str, list[str]],

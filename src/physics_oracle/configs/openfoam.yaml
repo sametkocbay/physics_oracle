@@ -66,7 +66,7 @@ control_dict:
       pitchAxis: "(0 0 1)"
       magUInf: __U_MAG__
       lRef: 1.0
-      Aref: 1.0
+      Aref: 0.01          # chord (1.0) x span extrusion (0.01); NOT 1.0, else Cl/Cd come out 100x low
     residuals:
       type: residuals
       libs: ['"libutilityFunctionObjects.so"']
@@ -75,6 +75,11 @@ control_dict:
       fields: [U, p, k, omega]
     yPlus:
       type: yPlus
+      libs: ['"libfieldFunctionObjects.so"']
+      writeControl: writeTime
+      patches: [airfoilWalls]
+    wallShearStress:
+      type: wallShearStress
       libs: ['"libfieldFunctionObjects.so"']
       writeControl: writeTime
       patches: [airfoilWalls]

@@ -319,15 +319,120 @@ def boundary_markers(faces: list[list[int]], owner: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Wall-surface table (Option B: a per-face table on the airfoil boundary)
+# ---------------------------------------------------------------------------
+
+def _parse_patch_vector_field(path: Path, patch_name: str) -> np.ndarray:
+    """Return the (M, 3) boundaryField values of a volVectorField on `patch_name`.
+
+    Handles both `value nonuniform List<vector> M (...)` and the degenerate
+    `value uniform (a b c)` form.  Returns an empty array if not found.
+    """
+    text = _read_text(path)
+    text = re.sub(r"//[^\n]*", "", text)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    # The patch sub-dict has no nested braces, so a non-greedy grab to the first
+    # closing brace isolates it (the vector list uses parentheses, not braces).
+    m = re.search(patch_name + r"\s*\{(.*?)\}", text, flags=re.DOTALL)
+    if not m:
+        return np.empty((0, 3))
+    body = m.group(1)
+    vec = rf"\(\s*({_NUM_RE})\s+({_NUM_RE})\s+({_NUM_RE})\s*\)"
+    trips = re.findall(vec, body)
+    if trips:
+        return np.asarray(trips, dtype=float)
+    mu = re.search(r"uniform\s*" + vec, body)
+    if mu:
+        return np.asarray([mu.groups()], dtype=float)
+    return np.empty((0, 3))
+
+
+def wall_surface_table(faces: list[list[int]], owner: np.ndarray,
+                       patches: list[dict], points3: np.ndarray,
+                       cell_centers2: np.ndarray, p_internal: np.ndarray,
+                       shear_vecs: np.ndarray) -> dict:
+    """Build the airfoil-surface table (one row per wall face).
+
+    All arrays are ordered by patch face, which is exactly the order OpenFOAM
+    writes patch boundaryField values, so `shear_vecs[i]` corresponds to the
+    i-th collected wall face.  Returns kinematic quantities (consistent with the
+    solver's kinematic `p` and the [0 2 -2] wallShearStress units).
+
+    Keys (M = number of wall faces):
+      wall_xy     (M, 2)  face-center coordinates, same frame as cell_centers
+      wall_normal (M, 2)  unit normal, pointing from the surface into the fluid
+      wall_shear  (M, 2)  kinematic wall shear stress vector (tau_w / rho)
+      wall_p      (M,)    kinematic surface pressure (= adjacent cell p; the
+                          airfoil p BC is zeroGradient, so p_wall = p_owner)
+      wall_length (M,)    2D edge length of the face (for surface integration)
+      wall_cell   (M,)    owner cell index (link back to the volume cloud)
+    """
+    xy, normal, length, wp, cell_idx = [], [], [], [], []
+    for pch in patches:
+        if pch["name"] not in ("airfoilWalls", "airfoil"):
+            continue
+        for fi in range(pch["startFace"], pch["startFace"] + pch["nFaces"]):
+            if fi >= len(owner):
+                continue
+            verts_xy = points3[faces[fi]][:, :2]
+            fc = verts_xy.mean(axis=0)
+            ci = int(owner[fi])
+            oc = cell_centers2[ci]
+            n = oc - fc
+            nn = np.linalg.norm(n)
+            n = n / nn if nn > 0 else np.array([0.0, 0.0])
+            # 2D edge length: front/back extrusion vertices share xy, so the max
+            # pairwise xy separation is the edge length.
+            d = np.linalg.norm(verts_xy[:, None, :] - verts_xy[None, :, :], axis=-1)
+            xy.append(fc)
+            normal.append(n)
+            length.append(float(d.max()))
+            wp.append(float(p_internal[ci]))
+            cell_idx.append(ci)
+
+    xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+    normal = np.asarray(normal, dtype=float).reshape(-1, 2)
+    length = np.asarray(length, dtype=float)
+    wp = np.asarray(wp, dtype=float)
+    cell_idx = np.asarray(cell_idx, dtype=np.int64)
+
+    m = xy.shape[0]
+    if shear_vecs.shape[0] == m:
+        shear = shear_vecs[:, :2].astype(float)
+    else:
+        # Length mismatch (missing or stale wallShearStress) — store NaNs so the
+        # table stays aligned rather than silently dropping the field.
+        LOG.warning("wall shear count %d != %d wall faces; storing NaN shear",
+                    shear_vecs.shape[0], m)
+        shear = np.full((m, 2), np.nan)
+
+    return {
+        "wall_xy": xy,
+        "wall_normal": normal,
+        "wall_shear": shear,
+        "wall_p": wp,
+        "wall_length": length,
+        "wall_cell": cell_idx,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Run OF post-processing helpers
 # ---------------------------------------------------------------------------
 
-def run_postprocess(of_case_dir: Path, func: str, timeout: int = 600) -> bool:
-    """Run `foamPostProcess -func <func> -latestTime` (OF13 Foundation)."""
+def run_postprocess(of_case_dir: Path, func: str, timeout: int = 600,
+                    solver: str | None = None) -> bool:
+    """Run `foamPostProcess -func <func> -latestTime` (OF13 Foundation).
+
+    ``solver`` constructs a solver module so model-dependent function objects
+    (e.g. ``wallShearStress``, which needs ``nuEff`` from the turbulence model)
+    can find the momentum-transport model in the database.
+    """
+    solver_opt = f"-solver {solver} " if solver else ""
     cmd = (
         "set -e && "
         f"if [ -z \"${{WM_PROJECT_DIR:-}}\" ]; then source {os.environ.get('OPENFOAM_BASHRC', '/opt/openfoam13/etc/bashrc')}; fi && "
-        f"cd {of_case_dir.resolve()} && foamPostProcess -func {func} -latestTime"
+        f"cd {of_case_dir.resolve()} && foamPostProcess {solver_opt}-func {func} -latestTime"
     )
     log = of_case_dir / f"postProcess.{func}.log"
     with log.open("w") as f:
@@ -385,16 +490,21 @@ def parse_force_coeffs(of_case_dir: Path) -> dict:
         return {"iter": np.array([]), "Cl": np.array([]), "Cd": np.array([])}
     arr = np.array(rows)
     last_header = header[-1] if header else ""
+    # lstrip("#") already removes the leading '#', so the remaining tokens line
+    # up 1:1 with the data columns (token 0 == Time == arr column 0).  Header
+    # layout is e.g. "# Time  Cm  Cd  Cl  Cl(f)  Cl(r)".
     cols = last_header.lstrip("#").split()
-    def col(name: str) -> int | None:
-        for i, c in enumerate(cols):
-            if c == name:
-                return i - 1                      # cols list includes the leading '#'
+    def col(*names: str) -> int | None:
+        for name in names:
+            for i, c in enumerate(cols):
+                if c == name:
+                    return i
         return None
-    cl_i = col("Cl") or col("Cl(t)") or col("Cl_total")
-    cd_i = col("Cd") or col("Cd(t)") or col("Cd_total")
-    if cl_i is None: cl_i = 4 if arr.shape[1] > 4 else None
-    if cd_i is None: cd_i = 1 if arr.shape[1] > 1 else None
+    cl_i = col("Cl", "Cl(t)", "Cl_total")
+    cd_i = col("Cd", "Cd(t)", "Cd_total")
+    # Fallbacks match the standard forceCoeffs.dat layout: Time Cm Cd Cl ...
+    if cl_i is None: cl_i = 3 if arr.shape[1] > 3 else None
+    if cd_i is None: cd_i = 2 if arr.shape[1] > 2 else None
     iters = arr[:, 0].astype(int)
     cl = arr[:, cl_i] if cl_i is not None and cl_i < arr.shape[1] else np.full(len(iters), np.nan)
     cd = arr[:, cd_i] if cd_i is not None and cd_i < arr.shape[1] else np.full(len(iters), np.nan)
@@ -413,6 +523,10 @@ def extract_case(of_case_dir: Path, case_dir: Path, case_id: str) -> dict:
     # Try to materialize cell centers; if it fails we'll fall back.
     cc_ok = run_postprocess(of_case_dir, "writeCellCentres")
     yp_ok = run_postprocess(of_case_dir, "yPlus")
+    # wallShearStress needs the turbulence model, so it must be run through a
+    # solver module (otherwise "Unable to find turbulence model in the database").
+    ws_ok = run_postprocess(of_case_dir, "wallShearStress",
+                            solver="incompressibleFluid")
 
     time_dir = latest_time_dir(of_case_dir)
     LOG.info("[%s] extracting from time dir %s", case_id, time_dir.name)
@@ -466,6 +580,15 @@ def extract_case(of_case_dir: Path, case_dir: Path, case_id: str) -> dict:
 
     # ---- boundary markers ----
     markers = boundary_markers(faces, owner, n_cells, patches)
+
+    # ---- wall-surface table (airfoil boundary, one row per wall face) ----
+    ws_path = time_dir / "wallShearStress"
+    shear_vecs = _parse_patch_vector_field(ws_path, "airfoilWalls") \
+        if (ws_path.exists() or ws_path.with_suffix(".gz").exists()) \
+        else np.empty((0, 3))
+    p_wall_source = p.ravel() if p.ndim > 1 else p
+    wall = wall_surface_table(faces, owner, patches, points3, cell_centers2,
+                              p_wall_source, shear_vecs)
 
     # ---- airfoil polygon (from polyMesh, ordered) ----
     airfoil_pts3 = []
@@ -544,6 +667,9 @@ def extract_case(of_case_dir: Path, case_dir: Path, case_id: str) -> dict:
         h.create_dataset("points", data=points2)
         h.create_dataset("connectivity", data=connectivity)
         h.create_dataset("boundary_markers", data=markers)
+        g = h.create_group("wall")
+        for key, arr in wall.items():
+            g.create_dataset(key, data=arr)
 
     with h5py.File(case_dir / "geometry.h5", "w") as h:
         h.create_dataset("airfoil_coordinates", data=airfoil_coords)

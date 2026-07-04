@@ -66,6 +66,10 @@ def build_sample(case_dir: Path, bbox: dict, crop: bool, dtype: np.dtype):
     with h5py.File(mesh_path, "r") as h:
         cell_centers = h["cell_centers"][:]
         boundary_markers = h["boundary_markers"][:]
+        # Airfoil-surface table (Option B).  Not cropped — every wall face lies
+        # on the airfoil, well inside the bounding box.  Absent for cases
+        # extracted before wall support was added.
+        wall = {k: h["wall"][k][:] for k in h["wall"]} if "wall" in h else {}
 
     x = cell_centers[:, 0]
     y = cell_centers[:, 1]
@@ -108,6 +112,10 @@ def build_sample(case_dir: Path, bbox: dict, crop: bool, dtype: np.dtype):
         "cd":            dtype(cd),
         "is_wall":       (boundary_markers[mask] == 1).astype(np.uint8),
     }
+    # Wall-surface arrays keep their own row count (M wall faces); wall_cell
+    # stays int, everything else follows the sample dtype.
+    for key, arr in wall.items():
+        sample[key] = arr.astype(np.int64 if key == "wall_cell" else dtype)
     return sample, split
 
 
@@ -143,6 +151,11 @@ def main() -> None:
                    help="Save arrays as float64 instead of float32")
     p.add_argument("--file", metavar="CASE_ID",
                    help="Process a single case by name (e.g. NACA0012_p3.0_2.5e5)")
+    p.add_argument("--split-filter", metavar="SPLIT",
+                   help="Only export cases whose meta.yaml split equals SPLIT (e.g. 'ood').")
+    p.add_argument("--limit", type=int,
+                   help="Stop after writing this many cases per split (deterministic, "
+                        "case-id order). Used to emit exactly N OOD cases.")
     args = p.parse_args()
 
     bbox = ml["bounding_box"]
@@ -150,6 +163,7 @@ def main() -> None:
     dtype = np.float64 if (args.double or default_dtype == "float64") else np.float32
 
     csv_rows_by_split: dict[str, list[dict]] = defaultdict(list)
+    n_written_by_split: dict[str, int] = defaultdict(int)
     n_ok = n_skip = 0
 
     if args.file:
@@ -170,6 +184,14 @@ def main() -> None:
             continue
 
         sample, split = result
+
+        if args.split_filter and split != args.split_filter:
+            n_skip += 1
+            continue
+        if args.limit is not None and n_written_by_split[split] >= args.limit:
+            n_skip += 1
+            continue
+        n_written_by_split[split] += 1
         split_dir = args.output_dir / split
         split_dir.mkdir(parents=True, exist_ok=True)
 

@@ -273,6 +273,26 @@ This retains the near-wake and boundary-layer region while discarding the far-fi
 
 N ≈ 220 000 points per case (after bounding-box crop from ~281 000 total cells).
 
+In addition to the volume point cloud, each file carries a separate
+airfoil-surface table with one row per wall face (M rows, M ≈ 240, aligned by
+wall-face index). These sit on the airfoil surface itself, unlike `is_wall`
+which marks the first layer of volume cells just off the wall. Quantities are
+kinematic (divided by density, consistent with `p`), matching OpenFOAM's
+`wallShearStress` function object.
+
+| Field | Shape | dtype | Description |
+|-------|-------|-------|-------------|
+| `wall_xy` | (M, 2) | float32 | Wall-face-center coordinates (same frame as `x`, `y`) |
+| `wall_normal` | (M, 2) | float32 | Unit surface normal, pointing from the wall into the fluid |
+| `wall_shear` | (M, 2) | float32 | Kinematic wall shear stress vector τ_w / ρ (m²/s²) |
+| `wall_p` | (M,) | float32 | Kinematic surface pressure (m²/s²) |
+| `wall_length` | (M,) | float32 | Face edge length (for surface integration) |
+| `wall_cell` | (M,) | int64 | Owner cell index — links each face back to the volume cloud |
+
+Skin friction and pressure coefficients follow directly, `cf = |wall_shear| /
+(0.5·U∞²)` and `cp = wall_p / (0.5·U∞²)`. The wall arrays are present for all
+splits (`train`, `val`, `test`, `ood`).
+
 ### 8.3 Usage
 
 ```bash

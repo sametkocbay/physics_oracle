@@ -34,6 +34,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import math
+
 import numpy as np
 from scipy.optimize import brentq
 
@@ -66,9 +68,11 @@ EXTRUSION_DZ = 0.01          # 1-cell-thick z extrusion (matches gmsh path)
 
 N_AIRFOIL = 241              # nodes around airfoil (TE -> LE -> TE)
 N_WAKE = 120                 # nodes per wake leg (TE -> outlet)
-N_LAYERS = 120               # cells in wall-normal direction
-YPLUS_TARGET = 0.8           # wall y+ design target
-RE_DESIGN = 5.0e5            # used for the BL first-cell sizing
+N_LAYERS = 120               # wall-normal cells (floor; grows if needed at high Re)
+YPLUS_TARGET = 0.8           # wall y+ design target (held ~constant vs Re)
+RE_DESIGN = 5.0e5            # legacy fixed design Re (optional override only)
+GROWTH_MAX = 1.2             # cap on wall-normal geometric growth ratio (§4.2)
+N_LAYERS_CAP = 300           # upper bound on the adaptive wall-normal cell count
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +142,17 @@ def _solve_growth(L: float, y1: float, n_cells: int) -> float:
     ))
 
 
+def _layers_for_growth(L: float, y1: float, r_max: float,
+                       n_min: int, n_cap: int) -> int:
+    """Smallest wall-normal cell count whose geometric distribution (first cell
+    ``y1``, ratio <= ``r_max``) spans ``L``. Floored at ``n_min`` and capped at
+    ``n_cap``. Keeps near-wall growth bounded when ``y1`` shrinks at high Re."""
+    if y1 <= 0.0 or y1 * n_min >= L:
+        return n_min
+    n = math.ceil(math.log1p((L / y1) * (r_max - 1.0)) / math.log(r_max))
+    return int(min(n_cap, max(n_min, n)))
+
+
 def _geom_nodes(L: float, y1: float, n_cells: int) -> np.ndarray:
     r = _solve_growth(L, y1, n_cells)
     s = np.zeros(n_cells + 1)
@@ -165,7 +180,7 @@ def build_c_mesh_nodes(
     x_outlet: float = DOMAIN_X_OUTLET,
     d_far: float = DOMAIN_D_FAR,
     yplus_target: float = YPLUS_TARGET,
-    re_design: float = RE_DESIGN,
+    re_design: float | None = None,
     chord: float = CHORD,
     nu: float = NU,
 ) -> tuple[np.ndarray, int, int]:
@@ -184,11 +199,13 @@ def build_c_mesh_nodes(
 
     m_inf = math.tan(math.radians(aoa_deg))   # freestream slope (AoA)
 
-    # BL first-cell height sized for y+ at the design Re (5e5 worst case).
-    # We use re_design here, not re_value, so meshes across the dataset
-    # share the same wall spacing -- matching the gmsh path's intent.
-    U_design = re_design * nu / chord
-    y1 = _first_cell_height(yplus_target, re_design, U_design, nu)
+    # BL first-cell height sized for y+ at the *actual* case Re, so wall y+
+    # stays ~yplus_target across the whole Reynolds range. (The old fixed
+    # re_design=5e5 sizing let y+ drift from ~0.2 at Re 1e5 to ~4 at Re 3e6.)
+    # Pass re_design explicitly to force a single dataset-wide wall spacing.
+    re_size = re_value if re_design is None else re_design
+    U_size = re_size * nu / chord
+    y1 = _first_cell_height(yplus_target, re_size, U_size, nu)
 
     te_sp = 0.5 * (
         float(np.linalg.norm(airfoil[1] - airfoil[0]))
@@ -220,6 +237,17 @@ def build_c_mesh_nodes(
     fr_bot = np.linspace(0.0, 1.0, n_wake)
     ff[n_wake + n_int:, 0] = chord_mid + (x_outlet - chord_mid) * fr_bot
     ff[n_wake + n_int:, 1] = -d_far
+
+    # Adaptive wall-normal resolution: shrinking y1 at high Re steepens the
+    # geometric growth, so add layers to keep the ratio <= GROWTH_MAX. Floored
+    # at the requested n_layers -- within the trained band (Re <=~3e6) it stays
+    # at the floor so mesh topology is unchanged; only very high Re adds layers.
+    L_max = max(float(np.linalg.norm(ff[i] - inner[i])) for i in range(ni))
+    n_layers = _layers_for_growth(L_max, y1, GROWTH_MAX,
+                                  n_min=n_layers, n_cap=N_LAYERS_CAP)
+    growth = _solve_growth(L_max, y1, n_layers)
+    LOG.info("BL sizing: Re=%.3g  y+_target=%.2f  y1=%.3e  n_layers=%d  max_growth=%.3f",
+             re_size, yplus_target, y1, n_layers, growth)
 
     # Pure TFI grid: linear interpolation inner -> ff with geometric j-clustering.
     nj = n_layers + 1
