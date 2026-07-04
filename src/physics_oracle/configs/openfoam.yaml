@@ -114,6 +114,7 @@ fv_schemes:
     default: 'no'
     p: ~
     phi: ~
+    Phi: ~          # required by the potentialFoam initialisation step
   wallDist:
     method: meshWave
 
@@ -133,6 +134,19 @@ fv_solution:
       smoother: symGaussSeidel
       tolerance: 1.0e-8
       relTol: 0.1
+    # Velocity potential solved by the potentialFoam pre-step (cold-start init).
+    Phi:
+      solver: GAMG
+      smoother: DIC
+      tolerance: 1.0e-6
+      relTol: 0.01
+      cacheAgglomeration: 'true'
+      agglomerator: faceAreaPair
+      nCellsInCoarsestLevel: 10
+      mergeLevels: 1
+  # Used only by the potentialFoam initialisation step.
+  potentialFlow:
+    nNonOrthogonalCorrectors: 10
   SIMPLE:
     nNonOrthogonalCorrectors: 2
     consistent: 'yes'
@@ -144,8 +158,10 @@ fv_solution:
     fields:
       p: 0.3
     equations:
-      U: 0.7
-      '"(k|omega)"': 0.7
+      # Softened from 0.7 for robustness at high AoA / high Re, where an
+      # aggressive momentum relaxation lets the first iterations overshoot.
+      U: 0.5
+      '"(k|omega)"': 0.5
   cache:
     grad(U): ~
 

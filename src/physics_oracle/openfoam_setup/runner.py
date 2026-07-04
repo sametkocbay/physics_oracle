@@ -19,6 +19,42 @@ LOG = setup_logging()
 OPENFOAM_BASHRC = os.environ.get("OPENFOAM_BASHRC", "/opt/openfoam13/etc/bashrc")
 
 
+def run_potential_init(of_case_dir: Path, log_path: Path | None = None,
+                       timeout: int = 10 * 60) -> int:
+    """Best-effort potential-flow initialisation of U (and p) before the steady
+    solver.
+
+    Cold-starting incompressibleFluid from a uniform field at high Re / high AoA
+    overshoots on the first pressure solve and diverges (linear solver blows up
+    -> SIGFPE). A divergence-free potential-flow start avoids that. This is
+    NON-FATAL: on any failure we log and let foamRun cold-start exactly as
+    before, so adding it can only help. Requires the ``Phi`` solver and
+    ``potentialFlow`` block in fvSolution (see configs/openfoam.yaml).
+    """
+    log_path = log_path or (of_case_dir / "potentialFoam.log")
+    cmd = (
+        f"source {OPENFOAM_BASHRC} && "
+        f"cd {of_case_dir.resolve()} && potentialFoam -writep"
+    )
+    try:
+        with log_path.open("w") as f:
+            proc = subprocess.run(
+                ["bash", "-c", cmd],
+                stdout=f, stderr=subprocess.STDOUT,
+                timeout=timeout, check=False,
+            )
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        LOG.warning("[%s] potentialFoam init timed out — cold-starting", of_case_dir.name)
+        return 1
+    if rc != 0:
+        LOG.warning("[%s] potentialFoam init exit %d — cold-starting foamRun",
+                    of_case_dir.name, rc)
+    else:
+        LOG.info("[%s] potentialFoam init OK", of_case_dir.name)
+    return rc
+
+
 def run_simple_foam(of_case_dir: Path, log_path: Path | None = None,
                     timeout: int = 60 * 60 * 6) -> int:
     """Run foamRun -solver incompressibleFluid in `of_case_dir`. Returns the exit code.
@@ -27,7 +63,11 @@ def run_simple_foam(of_case_dir: Path, log_path: Path | None = None,
     OF 13 needs its bashrc sourced; we wrap the call in a plain bash -c (not -lc)
     so that cluster login scripts do not reset PATH/LD_LIBRARY_PATH after sourcing.
     The log is written to simpleFoam.log for compatibility with the log parser.
+
+    A best-effort potentialFoam pre-step seeds a divergence-free field so the
+    steady solver does not blow up on a cold start (see run_potential_init).
     """
+    run_potential_init(of_case_dir)
     log_path = log_path or (of_case_dir / "simpleFoam.log")
     cmd = (
         f"set -e && "
