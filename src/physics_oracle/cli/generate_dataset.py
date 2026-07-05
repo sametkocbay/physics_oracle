@@ -197,6 +197,19 @@ def run_case(spec: CaseSpec, args: argparse.Namespace, solver_hash: str) -> dict
         else:
             mesher = generate_c_mesh if args.c_mesh else generate_mesh
             mesh_quality = mesher(spec.of_case_dir, spec.case_id)
+            if mesh_quality and mesh_quality.get("errors"):
+                # checkMesh reported hard errors (negative volumes, open
+                # cells, ...) — the solver would SIGFPE on such a mesh, so
+                # reject cleanly instead of running it.  Seen for extreme
+                # forward-camber profiles whose freestream-aligned wake cut
+                # folds the TFI grid at strongly negative AoA.
+                qc_result = {"accepted": False, "rejections": ["mesh_invalid"],
+                             "flags": [], "metrics": {}}
+                append_rejection(spec.case_id, qc_result["rejections"])
+                LOG.warning("[%s] rejected: invalid mesh (%s)", spec.case_id,
+                            mesh_quality["errors"][0].strip())
+                write_meta(spec, qc_result, mesh_quality, solver_hash)
+                return qc_result
             rc = run_simple_foam(spec.of_case_dir, timeout=args.solver_timeout,
                                  spec=spec, end_time=args.max_iter)
             if rc != 0:
