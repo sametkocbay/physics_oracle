@@ -26,9 +26,38 @@ def _qc_config() -> dict:
     return yaml.safe_load(POSTPROCESS_CONFIG_PATH.read_text())["qc"]
 
 
+def _force_stationarity(cl: np.ndarray, cd: np.ndarray, window: int,
+                        std_rel_max: float, drift_rel_max: float) -> dict:
+    """Trailing-window stationarity of the force coefficients.
+
+    A case is 'stationary' when BOTH Cl and Cd have relative scatter
+    (std/|mean|) and half-window mean drift below the bounds over the last
+    ``window`` iterations.  |mean| is floored to avoid a symmetric-case
+    Cl ~ 0 blowing up the relative measure."""
+    out: dict = {"stationary": False}
+    if cl.size < window or cd.size < window:
+        return out
+    half = window // 2
+    for name, hist in (("cl", cl), ("cd", cd)):
+        tail = hist[-window:]
+        mean = float(np.mean(tail))
+        denom = max(abs(mean), 1e-3)
+        out[f"{name}_mean"] = mean
+        out[f"{name}_std_rel"] = float(np.std(tail) / denom)
+        out[f"{name}_drift_rel"] = float(
+            abs(np.mean(tail[half:]) - np.mean(tail[:half])) / denom)
+    out["stationary"] = all(
+        out[f"{n}_{m}_rel"] <= bound
+        for n in ("cl", "cd")
+        for m, bound in (("std", std_rel_max), ("drift", drift_rel_max))
+    )
+    return out
+
+
 def quality_check(case_dir: Path, max_iter: int | None = None) -> dict:
     cfg = _qc_config()
     orders_drop_min = float(cfg["orders_drop_min"])
+    orders_drop_hard_min = float(cfg.get("orders_drop_hard_min", orders_drop_min))
     y_plus_max = float(cfg["y_plus_max"])
     iter_limit = int(max_iter if max_iter is not None else cfg["iter_limit"])
 
@@ -54,6 +83,15 @@ def quality_check(case_dir: Path, max_iter: int | None = None) -> dict:
         converged = bool(h.attrs.get("converged", False))
         drops = {key.replace("orders_drop_", ""): float(h.attrs[key])
                  for key in h.attrs if key.startswith("orders_drop_")}
+        cl_hist = h["cl_history"][:] if "cl_history" in h else np.array([])
+        cd_hist = h["cd_history"][:] if "cd_history" in h else np.array([])
+
+    force_stat = _force_stationarity(
+        cl_hist, cd_hist,
+        window=int(cfg.get("force_tail_window", 500)),
+        std_rel_max=float(cfg.get("force_std_rel_max", 0.02)),
+        drift_rel_max=float(cfg.get("force_drift_rel_max", 0.02)),
+    )
 
     metrics = {
         "iterations_total": iters_total,
@@ -64,12 +102,28 @@ def quality_check(case_dir: Path, max_iter: int | None = None) -> dict:
         "min_omega": float(np.min(omega)) if omega.size else None,
         "max_y_plus": float(np.nanmax(y_plus)) if y_plus.size and not np.all(np.isnan(y_plus)) else None,
         "drops": drops,
+        "force_stationarity": force_stat,
     }
 
-    if any(v < orders_drop_min for v in drops.values()):
-        rejections.append("residuals_under_4_orders")
+    # Residual gate with a force-stationarity gray zone:
+    #   min_drop >= orders_drop_min                    -> pass
+    #   hard_min <= min_drop < orders_drop_min         -> pass ONLY if the
+    #       trailing Cl/Cd are stationary (slow p-norm convergence at high Re
+    #       can hold a physically steady case just under the full gate)
+    #   min_drop < hard_min                            -> reject (empirically
+    #       these are genuinely unsteady flows)
     if not drops:
         rejections.append("no_residuals_parsed")
+    else:
+        min_drop = min(drops.values())
+        if min_drop >= orders_drop_min:
+            pass
+        elif min_drop >= orders_drop_hard_min and force_stat["stationary"]:
+            flags.append("gray_zone_force_accepted")
+        else:
+            rejections.append("residuals_under_4_orders")
+            if min_drop >= orders_drop_hard_min:
+                rejections.append("forces_not_stationary")
     if k.size and np.any(k < 0):
         rejections.append("negative_k")
     if omega.size and np.any(omega < 0):
