@@ -3,7 +3,8 @@
 These reproduce the OpenFOAM `fvc::` operators for the schemes used by the case
 (`configs/openfoam.yaml` `fvSchemes`): `linear`/`upwind`/`linearUpwindV`
 interpolation, `Gauss` gradient (plain and `cellLimited`), `Gauss` divergence
-with the `bounded` modifier, and `Gauss linear corrected` laplacian.
+with the `bounded` modifier, and `Gauss linear limited corrected 0.5`
+laplacian (pass `limit_coeff=None` for the pre-July-2026 unlimited form).
 
 Every operator is a scatter-add over mesh faces keyed by `owner`/`neighbour`
 (`torch.Tensor.index_add_`, autograd-friendly).  Geometry comes from
@@ -212,11 +213,12 @@ def gauss_div_tensor(X: torch.Tensor, X_bnd: list[torch.Tensor],
 
 def gauss_laplacian(gamma: torch.Tensor, gamma_bnd: list[torch.Tensor],
                     field: torch.Tensor, field_bnd: list[torch.Tensor],
-                    cell_grad: torch.Tensor, geom: MeshGeometry) -> torch.Tensor:
-    """`Gauss linear corrected` laplacian(gamma, field).
+                    cell_grad: torch.Tensor, geom: MeshGeometry,
+                    limit_coeff: float | None = 0.5) -> torch.Tensor:
+    """`Gauss linear limited corrected <limit_coeff>` laplacian(gamma, field).
 
     snGrad = nonOrthDeltaCoeffs·(field_N − field_P)
-             + nonOrthCorrectionVector · interp(cell_grad).
+             + limiter · nonOrthCorrectionVector · interp(cell_grad).
     `cell_grad` is the cell gradient OF's `correctedSnGrad` uses for the
     non-orthogonal correction — the **named** grad scheme of the field, i.e.
     `cellLimited` `grad(U)` for laplacian(nuEff,U) and `Gauss linear`
@@ -224,6 +226,15 @@ def gauss_laplacian(gamma: torch.Tensor, gamma_bnd: list[torch.Tensor],
     *limited* gradient is essential: the cellLimited limiter zeroes the
     wall-adjacent gradient of a uniform field, so the correction vanishes
     there as it does in OpenFOAM.
+
+    `limit_coeff` replicates OF's `limitedSnGrad` (fvSchemes
+    `limited corrected 0.5` — the pipeline default since July 2026):
+        limiter = min(1, λ·|snGrad_orth| / ((1−λ)·|corr| + SMALL))
+    per face (see limitedSnGrad.C).  It equals plain `corrected` wherever
+    the explicit correction is small relative to the orthogonal part
+    (faces below ~63 deg non-orthogonality).  Pass ``None`` to reproduce
+    the pre-July-2026 unlimited `corrected` scheme (dataset mesh v1).
+
     Boundary snGrad = patch deltaCoeffs·(field_b − field_P) (no correction).
     scalar field → (Nc,) ; vector field → (Nc,3).
     """
@@ -232,12 +243,25 @@ def gauss_laplacian(gamma: torch.Tensor, gamma_bnd: list[torch.Tensor],
     fo, fn = field[geom.owner], field[geom.neigh]
 
     if field.dim() == 1:                                    # scalar
+        orth = geom.ndc * (fn - fo)
         corr = (geom.ncorr * grad_f).sum(-1)
-        sn = geom.ndc * (fn - fo) + corr
+        if limit_coeff is not None:
+            lam = limit_coeff
+            limiter = torch.clamp(
+                lam * orth.abs() / ((1.0 - lam) * corr.abs() + 1e-15), max=1.0)
+            corr = limiter * corr
+        sn = orth + corr
         internal = gamma_face * geom.magSf * sn
     else:                                                   # vector
+        orth = geom.ndc.unsqueeze(-1) * (fn - fo)
         corr = torch.einsum("fi,fij->fj", geom.ncorr, grad_f)
-        sn = geom.ndc.unsqueeze(-1) * (fn - fo) + corr
+        if limit_coeff is not None:
+            lam = limit_coeff
+            limiter = torch.clamp(
+                lam * orth.norm(dim=-1) / ((1.0 - lam) * corr.norm(dim=-1) + 1e-15),
+                max=1.0)
+            corr = limiter.unsqueeze(-1) * corr
+        sn = orth + corr
         internal = (gamma_face * geom.magSf).unsqueeze(-1) * sn
 
     bnd = []
