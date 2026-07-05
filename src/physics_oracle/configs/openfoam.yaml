@@ -104,12 +104,20 @@ fv_schemes:
     div(phi,omega): bounded Gauss upwind
     div((nuEff*dev2(T(grad(U))))): Gauss linear
     div((nuEff*dev(T(grad(U))))): Gauss linear
+    div(div(phi,U)): Gauss linear   # required by potentialFoam -writep
+  # The C-mesh has a handful of near-degenerate faces at the sharp-TE/wake
+  # cut (max non-orthogonality ~89-90 deg on every mesh, in-band included).
+  # `limited corrected 0.5` bounds the explicit non-orthogonal correction to
+  # the implicit part; it is identical to `corrected` on faces below ~63 deg
+  # and prevents the correction from diverging on the degenerate ones (the
+  # unlimited form made potentialFoam's corrector loop and the high-Re p
+  # solves blow up).
   laplacianSchemes:
-    default: Gauss linear corrected
+    default: Gauss linear limited corrected 0.5
   interpolationSchemes:
     default: linear
   snGradSchemes:
-    default: corrected
+    default: limited corrected 0.5
   fluxRequired:
     default: 'no'
     p: ~
@@ -150,10 +158,13 @@ fv_solution:
   SIMPLE:
     nNonOrthogonalCorrectors: 2
     consistent: 'yes'
+    # 1e-6 so an early exit implies >= 4-5 orders of residual drop from any
+    # plausible starting level (the QC criterion is a relative drop; the old
+    # 1e-4/1e-5 could stop a well-initialised run before 4 measured orders).
     residualControl:
-      p: 1.0e-4
-      U: 1.0e-4
-      '"(k|omega)"': 1.0e-5
+      p: 1.0e-6
+      U: 1.0e-6
+      '"(k|omega)"': 1.0e-6
   relaxationFactors:
     fields:
       p: 0.3
@@ -164,6 +175,56 @@ fv_solution:
       '"(k|omega)"': 0.5
   cache:
     grad(U): ~
+
+# Two-stage startup continuation for cases outside the trained envelope
+# (|AoA| > gate.aoa_abs_deg_over  or  Re > gate.re_over).  Stage A runs
+# first-order momentum with heavy under-relaxation and field limiting to
+# survive the cold-start transient; stage B restarts from the stage-A field
+# with the production schemes above and runs to full convergence.  In-band
+# cases never enter this path, so their behavior is unchanged.
+# See runner.run_simple_foam / case_setup.write_stage_system.
+startup:
+  gate:
+    aoa_abs_deg_over: 5.0
+    re_over: 5.0e5
+  u_limit_factor: 4.0          # stage-A limitMag on U: max = factor * U_mag
+  omega_floor_factor: 1.0e-3   # stage-A bound on omega: min = factor * omega_inlet
+  stage_a:
+    iterations: 400
+    fv_schemes:
+      divSchemes:
+        div(phi,U): bounded Gauss upwind
+    fv_solution:
+      relaxationFactors:
+        fields:
+          p: 0.2
+        equations:
+          U: 0.3
+          '"(k|omega)"': 0.3
+      SIMPLE:
+        nNonOrthogonalCorrectors: 3
+        residualControl: {}    # never exit stage A early
+    fv_constraints:
+      limitU:
+        type: limitMag
+        cellZone: all
+        field: U
+        max: __U_LIM__
+      boundOmega:
+        type: bound
+        field: omega
+        min: __OMEGA_MIN__
+  # Stage-B overrides (gated cases only): slightly heavier under-relaxation
+  # damps the mild p limit cycle that marginal OOD cases (thin sections /
+  # high camber near the envelope edge) otherwise settle into at ~1e-4.
+  stage_b:
+    fv_solution:
+      relaxationFactors:
+        fields:
+          p: 0.2
+        equations:
+          U: 0.4
+          '"(k|omega)"': 0.4
 
 # Boundary conditions, per field, per patch.  case_setup.py substitutes the
 # __U_X__/__U_Y__/__K__/__OMEGA__ sentinels with per-case numerics before

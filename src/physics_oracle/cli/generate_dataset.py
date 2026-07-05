@@ -139,7 +139,7 @@ def write_manifest(profiles: list[dict], splits: dict[str, list[str]],
 # ---------------------------------------------------------------------------
 
 def write_meta(spec: CaseSpec, qc_result: dict, mesh_quality: dict | None,
-               solver_hash: str) -> None:
+               solver_hash: str, solver_run_info: dict | None = None) -> None:
     inl = spec.inlet()
     meta = {
         "case_id": str(spec.case_id),
@@ -164,6 +164,8 @@ def write_meta(spec: CaseSpec, qc_result: dict, mesh_quality: dict | None,
         "qc_metrics": _to_native(qc_result.get("metrics", {})),
         "mesh_quality": _to_native(mesh_quality),
     }
+    if solver_run_info is not None:
+        meta["solver_run_info"] = _to_native(solver_run_info)
     spec.case_dir.mkdir(parents=True, exist_ok=True)
     (spec.case_dir / "meta.yaml").write_text(yaml.safe_dump(meta, sort_keys=False))
 
@@ -195,7 +197,8 @@ def run_case(spec: CaseSpec, args: argparse.Namespace, solver_hash: str) -> dict
         else:
             mesher = generate_c_mesh if args.c_mesh else generate_mesh
             mesh_quality = mesher(spec.of_case_dir, spec.case_id)
-            rc = run_simple_foam(spec.of_case_dir, timeout=args.solver_timeout)
+            rc = run_simple_foam(spec.of_case_dir, timeout=args.solver_timeout,
+                                 spec=spec, end_time=args.max_iter)
             if rc != 0:
                 LOG.warning("[%s] simpleFoam exited with rc=%d; "
                             "extraction may reflect unconverged fields",
@@ -216,7 +219,10 @@ def run_case(spec: CaseSpec, args: argparse.Namespace, solver_hash: str) -> dict
         qc_result = {"accepted": False, "rejections": [str(exc)],
                      "flags": ["exception"], "metrics": {}}
 
-    write_meta(spec, qc_result, mesh_quality, solver_hash)
+    run_info_path = spec.of_case_dir / "run_info.yaml"
+    solver_run_info = (yaml.safe_load(run_info_path.read_text())
+                       if run_info_path.exists() else None)
+    write_meta(spec, qc_result, mesh_quality, solver_hash, solver_run_info)
     return qc_result
 
 
