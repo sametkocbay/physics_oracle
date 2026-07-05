@@ -35,6 +35,21 @@ visualize:
     - { key: sdf, title: "SDF (wall distance)", cmap: viridis,  diverging: false }
 
 qc:
-  orders_drop_min: 4.0        # reject if any residual drops < this many orders
+  orders_drop_min: 4.0        # full residual acceptance: all fields >= this drop
+  orders_drop_hard_min: 3.5   # below this: always reject (empirically, cases
+                              # under ~3.7 orders are genuinely unsteady flows)
+  orders_drop_ref_window: 10  # reference residual = max over the first N iters
+                              # (robust to a good initial guess lowering iter-1)
+  orders_drop_tail_window: 50 # final residual = median over the last N iters
+                              # (robust to the phase of a mild limit cycle;
+                              # identical to the endpoint for converged runs)
+  # Gray zone [hard_min, orders_drop_min): accept only if the physical
+  # observables prove stationarity — trailing-window Cl AND Cd relative
+  # scatter and half-window drift below these bounds.  Rescues force-steady
+  # cases whose p residual norm converges slowly at high Re (e.g. thick
+  # sections at Re 2e6) without admitting unsteady flows.
+  force_tail_window: 500      # trailing iterations for the stationarity check
+  force_std_rel_max: 0.02     # std/|mean| bound for Cl and Cd
+  force_drift_rel_max: 0.02   # |mean(2nd half) - mean(1st half)|/|mean| bound
   y_plus_max: 5.0             # reject if max y+ exceeds this
   iter_limit: 5000            # flag if solver hits this iteration count

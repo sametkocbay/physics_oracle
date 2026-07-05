@@ -21,24 +21,37 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import yaml
 
 from physics_oracle.core.case_spec import parse_case_id
 from physics_oracle.core.logging import setup_logging
+from physics_oracle.core.paths import POSTPROCESS_CONFIG_PATH
 from physics_oracle.geometry.distance import naca_surface_distance
 from physics_oracle.geometry.naca import naca4_coordinates
 from physics_oracle.openfoam_setup.runner import detect_convergence, parse_solver_log
 
 
-def _first_converged_iter(history: dict[str, list[float]]) -> int:
+def _orders_drop_windows() -> tuple[int, int]:
+    """(orders_drop_ref_window, orders_drop_tail_window) from postprocess.yaml."""
+    cfg = yaml.safe_load(POSTPROCESS_CONFIG_PATH.read_text()).get("qc", {})
+    return (int(cfg.get("orders_drop_ref_window", 10)),
+            int(cfg.get("orders_drop_tail_window", 50)))
+
+
+def _first_converged_iter(history: dict[str, list[float]],
+                          ref_window: int = 10) -> int:
     """Return the first iteration at which all fields' residual ratios had
-    dropped ≥ 4 orders below the initial value (§5.7).  Returns 0 if never."""
+    dropped ≥ 4 orders below the reference value (§5.7).  Returns 0 if never.
+
+    The reference is the max over the first ``ref_window`` iterations, for
+    the same reason as in ``runner.detect_convergence``."""
     import math
     fields = list(history.keys())
     initials: dict[str, float] = {}
     for f in fields:
         vals = [v for v in history[f] if v == v and v > 0]
         if vals:
-            initials[f] = vals[0]
+            initials[f] = max(vals[:max(1, ref_window)])
     n = max(len(v) for v in history.values()) if history else 0
     for i in range(n):
         ok = True
@@ -465,27 +478,33 @@ def latest_time_dir(of_case_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def parse_force_coeffs(of_case_dir: Path) -> dict:
-    """Read postProcessing/forceCoeffs1/<t>/coefficient.dat (OF13) or forceCoeffs.dat."""
-    candidates = sorted((of_case_dir / "postProcessing" / "forceCoeffs1").glob("*/coefficient.dat"))
+    """Read postProcessing/forceCoeffs1/<t>/coefficient.dat (OF13) or forceCoeffs.dat.
+
+    A restarted run (e.g. the two-stage startup continuation) writes one
+    <startTime> directory per stage; all are read and concatenated in
+    numeric time order so the history spans the whole run."""
+    candidates = sorted((of_case_dir / "postProcessing" / "forceCoeffs1").glob("*/coefficient.dat"),
+                        key=lambda p: float(p.parent.name))
     if not candidates:
-        candidates = sorted((of_case_dir / "postProcessing" / "forceCoeffs1").glob("*/forceCoeffs.dat"))
+        candidates = sorted((of_case_dir / "postProcessing" / "forceCoeffs1").glob("*/forceCoeffs.dat"),
+                            key=lambda p: float(p.parent.name))
     if not candidates:
         return {"iter": np.array([]), "Cl": np.array([]), "Cd": np.array([])}
 
-    text = candidates[0].read_text()
     header = []
     rows = []
-    for line in text.splitlines():
-        if line.startswith("#"):
-            header.append(line)
-            continue
-        parts = line.split()
-        if not parts:
-            continue
-        try:
-            rows.append([float(x) for x in parts])
-        except ValueError:
-            continue
+    for cand in candidates:
+        for line in cand.read_text().splitlines():
+            if line.startswith("#"):
+                header.append(line)
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            try:
+                rows.append([float(x) for x in parts])
+            except ValueError:
+                continue
     if not rows:
         return {"iter": np.array([]), "Cl": np.array([]), "Cd": np.array([])}
     arr = np.array(rows)
@@ -627,7 +646,9 @@ def extract_case(of_case_dir: Path, case_dir: Path, case_id: str) -> dict:
     log_path = of_case_dir / "simpleFoam.log"
     parsed_log = parse_solver_log(log_path.read_text(errors="replace")
                                    if log_path.exists() else "")
-    conv = detect_convergence(parsed_log["history"])
+    ref_window, tail_window = _orders_drop_windows()
+    conv = detect_convergence(parsed_log["history"], ref_window=ref_window,
+                              tail_window=tail_window)
     forces = parse_force_coeffs(of_case_dir)
     n_iter = parsed_log["n_iter"]
 
@@ -649,7 +670,8 @@ def extract_case(of_case_dir: Path, case_dir: Path, case_id: str) -> dict:
     # iterations_to_convergence: first iter at which all fields' residuals
     # had dropped ≥ 4 orders.  If still converging, store n_iter so it's at
     # least informative for the QC step.
-    iters_to_conv = _first_converged_iter(parsed_log["history"]) or n_iter
+    iters_to_conv = _first_converged_iter(parsed_log["history"],
+                                          ref_window=ref_window) or n_iter
 
     # ---- write HDF5s ----
     case_dir.mkdir(parents=True, exist_ok=True)
