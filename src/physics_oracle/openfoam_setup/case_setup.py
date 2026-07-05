@@ -67,7 +67,12 @@ def _substitute(obj, mapping: dict[str, str]):
 def _per_case_mapping(spec: CaseSpec, end_time: int, write_interval: int) -> dict[str, str]:
     inl = spec.inlet()
     aoa_rad = math.radians(spec.aoa_deg)
+    startup = _load_config().get("startup", {})
+    u_limit = float(startup.get("u_limit_factor", 4.0)) * inl.U_mag
+    omega_min = float(startup.get("omega_floor_factor", 1.0e-3)) * inl.omega_inlet
     return {
+        "__U_LIM__":     _format_num(u_limit),
+        "__OMEGA_MIN__": _format_num(omega_min),
         "__U_X__":     _format_num(inl.U_x),
         "__U_Y__":     _format_num(inl.U_y),
         "__U_MAG__":   _format_num(inl.U_mag),
@@ -89,6 +94,20 @@ def _coerce_numeric_keys(d: dict, keys: tuple[str, ...]):
     for k in keys:
         if k in d and isinstance(d[k], str) and d[k].lstrip("-").isdigit():
             d[k] = int(d[k])
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursive dict merge where `override` wins.  An *empty* dict override
+    replaces the base value entirely (needed for `residualControl: {}` to
+    clear the production thresholds); non-empty dicts merge key-wise."""
+    out = dict(base)
+    for k, v in override.items():
+        if (isinstance(v, dict) and v
+                and isinstance(out.get(k), dict)):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +181,78 @@ def setup_openfoam_case(of_case_dir: Path, spec: CaseSpec,
     write_constant_dir(of_case_dir / "constant", cfg)
     write_system_dir(of_case_dir / "system", cfg, mapping, end_time, effective_interval)
     LOG.info("[%s] OpenFOAM case files written under %s", spec.case_id, of_case_dir)
+
+
+# ---------------------------------------------------------------------------
+# Two-stage startup continuation (configs/openfoam.yaml `startup:` section)
+# ---------------------------------------------------------------------------
+
+def startup_config() -> dict:
+    """The `startup:` section of openfoam.yaml ({} if absent)."""
+    return _load_config().get("startup", {}) or {}
+
+
+def write_stage_system(of_case_dir: Path, spec: CaseSpec, stage: str,
+                       stage_a_end: int, total_end: int,
+                       write_interval: int = 500) -> None:
+    """Rewrite system/{controlDict,fvSchemes,fvSolution,fvConstraints} for one
+    stage of the two-stage startup continuation.
+
+    Stage "A": first-order momentum, heavy under-relaxation, no
+    residualControl exit, limitMag(U) + bound(omega) fvConstraints, runs
+    [0, stage_a_end] with intermediate writes so a crash still leaves a
+    restart point.
+
+    Stage "B": production schemes/solution from the top-level config,
+    startFrom latestTime, endTime `total_end`, and an *empty* fvConstraints
+    (must overwrite the stage-A file, not merely delete it).
+    """
+    if stage not in ("A", "B"):
+        raise ValueError(f"stage must be 'A' or 'B', got {stage!r}")
+    system_dir = of_case_dir / "system"
+    system_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = copy.deepcopy(_load_config())
+    startup = cfg.get("startup", {}) or {}
+    stage_a = startup.get("stage_a", {}) or {}
+
+    if stage == "A":
+        end_time = int(stage_a.get("iterations", 400))
+        # Intermediate writes so an early death still leaves a restart point;
+        # purgeWrite in the production controlDict keeps only the latest.
+        interval = max(1, min(100, end_time))
+        fv_schemes = _deep_merge(cfg["fv_schemes"], stage_a.get("fv_schemes", {}))
+        fv_solution = _deep_merge(cfg["fv_solution"], stage_a.get("fv_solution", {}))
+        constraints = stage_a.get("fv_constraints", {}) or {}
+        start_from = "startTime"
+    else:
+        end_time = int(total_end)
+        interval = min(write_interval, end_time)
+        if end_time % interval != 0:
+            interval = end_time
+        stage_b = startup.get("stage_b", {}) or {}
+        fv_schemes = _deep_merge(cfg["fv_schemes"], stage_b.get("fv_schemes", {}))
+        fv_solution = _deep_merge(cfg["fv_solution"], stage_b.get("fv_solution", {}))
+        constraints = {}          # overwrite the stage-A constraints file
+        start_from = "latestTime"
+
+    mapping = _per_case_mapping(spec, end_time, interval)
+
+    cd = _substitute(cfg["control_dict"], mapping)
+    cd["startFrom"] = start_from
+    _coerce_numeric_keys(cd, ("endTime", "writeInterval", "startTime", "deltaT",
+                              "writePrecision", "timePrecision", "purgeWrite"))
+    (system_dir / "controlDict").write_text(
+        render_foam_dict("dictionary", "controlDict", cd))
+    (system_dir / "fvSchemes").write_text(
+        render_foam_dict("dictionary", "fvSchemes", fv_schemes))
+    (system_dir / "fvSolution").write_text(
+        render_foam_dict("dictionary", "fvSolution", _substitute(fv_solution, mapping)))
+    (system_dir / "fvConstraints").write_text(
+        render_foam_dict("dictionary", "fvConstraints",
+                         _substitute(constraints, mapping)))
+    LOG.info("[%s] stage-%s system dicts written (endTime=%d)",
+             spec.case_id, stage, end_time)
 
 
 # ---------------------------------------------------------------------------
