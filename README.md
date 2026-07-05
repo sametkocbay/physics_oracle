@@ -28,11 +28,15 @@ control, and ML export, in order.
 - **Dimensionality:** 2D
 - **Flow regime:** Steady, incompressible, fully turbulent (no transition modeling)
 - **Turbulence model:** k-ω SST
-- **Solver:** simpleFoam (OpenFOAM v13 Foundation)
-- **AoA range:** −5° to +15° (attached and mildly separated flow)
-- **Reynolds number range:** 1×10⁵ to 5×10⁵ (log-spaced)
+- **Solver:** `foamRun -solver incompressibleFluid` (OpenFOAM v13 Foundation; steady SIMPLE — the v13 successor of simpleFoam)
+- **AoA range (trained envelope):** −5° to +5°
+- **Reynolds number range (trained envelope):** 1×10⁵ to 5×10⁵ (log-spaced)
+- **Validated extended band (OOD generation):** |AoA| up to ~12°, Re up to ~2×10⁶
+  — enabled by the Reynolds-adaptive C-mesh (§4) and the two-stage startup
+  continuation (§5.5). Genuinely unsteady corners (e.g. very thin sections at
+  AoA ≳ 10°) have no steady RANS solution and are rejected at QC by design.
 
-Any case outside this envelope is an "OOD probe" — stored separately, never used for training or hyperparameter tuning.
+Any case outside the trained envelope is an "OOD probe" — stored separately, never used for training or hyperparameter tuning.
 
 ---
 
@@ -85,15 +89,34 @@ Examples: `NACA2412_p5.0_1.5e6`, `NACA0012_n2.5_3.0e5`, `NACA4415_p10.0_5.0e5`
 C-grid topology, identical structure for every case; only the airfoil coordinates and first-layer height vary. This keeps dataset size manageable and avoids mesh variability as a confounding factor.
 
 ### 4.1 Tooling
-- Gmsh with a parameterized script (`generate_mesh.py`)
-- Fully deterministic: same airfoil coordinates → same mesh, always
-- Domain: 20c upstream, 25c downstream, ±20c vertical (far field ≥ 20c from surface)
+
+Two meshers share the same `(of_case_dir, case_id) -> quality_dict` interface:
+
+- **Structured C-mesh** (`meshing/c_mesh.py`, selected with `--c-mesh`) — the
+  mesher used for the dataset. Builds the structured node array in Python
+  (closed-TE NACA + freestream-aligned wake cut + half-circle far field + TFI),
+  serialises it to Gmsh `.msh` and imports via `gmshToFoam`.
+- Gmsh unstructured (`meshing/gmsh_mesh.py`) — legacy/default path with a
+  boundary-layer field and triangular-prism outer mesh.
+
+Both are fully deterministic: same case id → same mesh, always.
+Domain: 20c upstream, 25c downstream, ±20c vertical (far field ≥ 20c from surface).
+
+**Reynolds adaptivity (C-mesh, mesh v2):**
+- First-layer height is sized from the flat-plate correlation *at the actual
+  case Re*, holding wall y+ ≈ 0.8 across the whole Reynolds band (the wall-normal
+  cell count grows above ~3×10⁶ to keep the geometric growth ratio ≤ 1.2).
+- The wake-cut first spacing grows with distance from the trailing edge
+  (`WAKE_CUT_AR_CAP = 100`), so the cut's first-layer cells keep a bounded
+  in-plane aspect ratio. Mesh v1 applied the wall y1 along the entire cut,
+  producing ~30,000:1 slivers with ~90° non-orthogonality in the far wake —
+  these destabilised the pressure solve at high Re and floored its residual.
 
 ### 4.2 Quality requirements
 - **y+ < 1** at the wall — k-ω SST low-Re mode, resolves viscous sublayer
-- **Growth ratio < 1.2** in boundary-layer normal direction
+- **Growth ratio ≤ 1.2** in boundary-layer normal direction
 - **≥ 30 cells** in the boundary layer
-- `checkMesh` non-orthogonality < 70, skewness < 4
+- `checkMesh` non-orthogonality < 70 (mesh v2 measures 66–68°), skewness < 4
 
 ---
 
@@ -141,29 +164,68 @@ omega_inlet = sqrt(k) / (C_μ^0.25 · L)
 ### 5.3 `system/fvSchemes`
 ```
 ddtSchemes      { default steadyState; }
-gradSchemes     { default Gauss linear; }
+gradSchemes     { default Gauss linear;  grad(U) cellLimited Gauss linear 1; }
 divSchemes {
-    div(phi,U)                   Gauss linearUpwind grad(U);
-    div(phi,k)                   Gauss linearUpwind grad(k);
-    div(phi,omega)               Gauss linearUpwind grad(omega);
+    div(phi,U)                   bounded Gauss linearUpwindV grad(U);
+    div(phi,k)                   bounded Gauss upwind;
+    div(phi,omega)               bounded Gauss upwind;
     div((nuEff*dev(T(grad(U))))) Gauss linear;
+    div(div(phi,U))              Gauss linear;   // potentialFoam -writep (diagnostics only)
 }
-laplacianSchemes { default Gauss linear corrected; }
+laplacianSchemes { default Gauss linear limited corrected 0.5; }
+snGradSchemes    { default limited corrected 0.5; }
 ```
+
+The non-orthogonal correction is **limited** (coefficient 0.5): identical to
+plain `corrected` on faces below ~63° non-orthogonality, but it bounds the
+explicit correction on the worst faces so it cannot diverge. The
+differentiable PyTorch residual (§10) implements the same limiter.
 
 ### 5.4 `system/fvSolution`
 ```
-p     GAMG / GaussSeidel     tol 1e-7  relTol 0.01
+p     GAMG / DICGaussSeidel   tol 1e-7  relTol 0.01
 U     smoothSolver            tol 1e-8  relTol 0.1
 k     smoothSolver            tol 1e-8  relTol 0.1
 omega smoothSolver            tol 1e-8  relTol 0.1
 
-SIMPLE relaxationFactors: p 0.3, U/k/omega 0.7
+SIMPLE (SIMPLEC, consistent yes)
+       relaxationFactors: p 0.3, U/k/omega 0.5
        nNonOrthogonalCorrectors 2
+       residualControl: p/U/k/omega 1e-6
 ```
 
-### 5.5 Convergence criteria
-Stop when **all** residuals drop ≥ 4 orders of magnitude from their initial value, OR Cl/Cd change < 0.1% over 200 consecutive iterations — whichever comes first. Maximum 5000 iterations; flag anything that hits the limit without meeting the criterion.
+### 5.5 Startup and initialisation
+
+Cases **cold-start from the uniform inlet field**. There is deliberately no
+potentialFoam pre-step: the zero-circulation potential field (no Kutta
+condition) forces the solver to shed a starting vortex along the wake cut and
+leaves the pressure residual limit-cycling around 1e-2 instead of converging
+(`runner.run_potential_init` remains available for diagnostics only).
+
+Cases outside the trained envelope (|AoA| > 5° or Re > 5×10⁵) run a
+**two-stage startup continuation** (`startup:` section in
+`configs/openfoam.yaml`, `runner._run_two_stage`):
+
+- **Stage A** (400 iterations): first-order `div(phi,U) upwind`, heavy
+  under-relaxation (p 0.2, U/k/omega 0.3), 3 non-orthogonal correctors, and
+  `fvConstraints` field limiting — `limitMag` on U (4×U∞) and a `bound` floor
+  on omega — to survive the cold-start transient at high Re/AoA.
+- **Stage B**: restarts from the stage-A field with the production schemes
+  above and slightly damped relaxation (p 0.2, U/k/omega 0.4) to full
+  convergence. Both stages append to one `simpleFoam.log`; stage metadata is
+  recorded in `run_info.yaml` and surfaced as `solver_run_info` in `meta.yaml`.
+
+In-band cases never enter this path, so trained-envelope behaviour is unchanged.
+
+### 5.6 Convergence criteria
+
+A case converges when **all** residuals (Ux, Uy, p, k, omega) drop ≥ 4 orders
+of magnitude, measured robustly: reference = max over the first 10 iterations,
+final = median over the last 50 (`qc.orders_drop_ref_window` /
+`orders_drop_tail_window` in `configs/postprocess.yaml`). The solver itself
+exits early at absolute residuals ≤ 1e-6 (`residualControl`). Maximum 5000
+iterations; anything hitting the limit without meeting the criterion is
+flagged, and acceptance falls to QC (§7).
 
 ---
 
@@ -212,9 +274,9 @@ nu: 1.0e-05
 chord: 1.0
 k_inlet: 3.375e-04
 omega_inlet: 0.1234
-mesh_version: v1
+mesh_version: v2
 openfoam_version: v13
-solver_settings_hash: "51bc03cd..."   # md5(fvSchemes + fvSolution)
+solver_settings_hash: "51bc03cd..."   # md5(configs/openfoam.yaml)
 generation_timestamp: "2026-05-07T15:23:22Z"
 converged: true
 iterations_to_convergence: 1842
@@ -230,14 +292,28 @@ split: train
 
 | Check | Threshold | Action |
 |-------|-----------|--------|
-| Residuals dropped | < 4 orders | reject |
+| Residuals dropped | ≥ 4.0 orders (all fields) | accept (residual gate) |
+| Residuals dropped | 3.5 – 4.0 orders (gray zone) | accept **only if forces stationary**, flag `gray_zone_force_accepted` |
+| Residuals dropped | < 3.5 orders | reject |
 | Negative k in field | any | reject |
 | Negative omega in field | any | reject |
 | y+ at wall | > 5 | reject |
 | Iterations hit limit | ≥ 5000 | flag |
 | Not converged | — | flag |
 
-Target acceptance rate: ~80–90%. Higher rejection rates indicate a mesh or BC problem.
+**Force stationarity** (gray zone only): over the trailing 500 iterations,
+both Cl and Cd must have relative scatter (std/|mean|) **and** half-window
+mean drift ≤ 2% (`force_*` keys in `configs/postprocess.yaml`). Empirically,
+every case under ~3.7 residual orders is a genuinely unsteady flow (5–46% Cl
+scatter) and stays rejected, while force-steady cases whose pressure-residual
+norm merely converges slowly at high Re (e.g. thick sections at Re 2×10⁶) are
+rescued instead of falsely rejected.
+
+Target acceptance rate: ~80–90% in-band. High-|AoA| OOD batches reject more —
+mostly thin sections beyond their steady-RANS limit — and the fill modes
+oversample to compensate. `scripts/diagnose_robustness.py` runs a fixed
+6-case diagnostic matrix (high AoA / high Re + an in-band control) through
+the production solver path and classifies any failures.
 
 ---
 
@@ -414,7 +490,8 @@ residual (usable as a physics-informed training loss):
   OpenFOAM at all.
 - The FVM operators reproduce the case's `fvSchemes` — linear / upwind /
   `linearUpwindV` interpolation, `Gauss` and `cellLimited` gradients, `bounded`
-  divergence, `corrected` laplacian — plus the explicit kOmegaSST source terms.
+  divergence, `limited corrected 0.5` laplacian (pass `limit_coeff=None` for
+  the pre-mesh-v2 unlimited form) — plus the explicit kOmegaSST source terms.
 - It matches the OpenFOAM coded-FO residual to **correlation 1.0** (field-L2
   ≤ 0.2 %) on realistic predictions.
 
@@ -456,6 +533,9 @@ itself is sub-second); `--n-steps 3` ~10 s.
 physics_oracle/
 ├── pyproject.toml                          # uv / hatchling — single physics_oracle package
 ├── uv.lock
+├── scripts/
+│   ├── diagnose_robustness.py              # 6-case solver-robustness matrix + failure classifier
+│   └── prune_rejected.py                   # delete rejected case dirs listed in rejection_log.csv
 └── src/
     └── physics_oracle/
         ├── __init__.py                     # public API re-exports

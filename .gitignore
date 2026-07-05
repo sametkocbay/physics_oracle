@@ -11,3 +11,6 @@ dataset/
 *.png
 *.npz
 *.csv
+
+# Diagnostic / generation run logs (repo root)
+dataset_*.log
