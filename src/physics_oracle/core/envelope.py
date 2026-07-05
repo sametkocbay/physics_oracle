@@ -33,16 +33,19 @@ ENVELOPE = {
 }
 
 OPENFOAM_VERSION = "v13"
-MESH_VERSION = "v1"
+# v2: wake-cut first-layer spacing grows with distance from the TE
+# (WAKE_CUT_AR_CAP in meshing/c_mesh.py) — removes the ~90 deg non-orthogonal
+# sliver cells on the far-wake cut that v1 had.  Airfoil BL spacing unchanged.
+MESH_VERSION = "v2"
 
 
 # ---------------------------------------------------------------------------
 # Out-of-distribution (OOD) probe envelope
 #
-# The OOD set is built from conditions the in-domain envelope above never sees,
-# WITHOUT leaving the Reynolds band the C-mesh was validated for (first-cell
-# height is fixed, so pushing Re higher would drive y+ past the wall-function
-# limit and QC would reject the cases anyway).  OOD-ness therefore comes from:
+# The OOD set is built from conditions the in-domain envelope above never
+# sees.  By default Re stays inside the trained band, but the mesh sizes its
+# first cell for the actual case Re and the solver hardening (two-stage
+# startup) makes Re up to ~2e6 viable via --re-range.  OOD-ness comes from:
 #   * atypical *geometry* not present in the trained profiles
 #       - thinner than 8 % chord,
 #       - thicker than 18 % chord,
@@ -54,9 +57,12 @@ MESH_VERSION = "v1"
 # ---------------------------------------------------------------------------
 
 OOD_ENVELOPE = {
-    # Re kept inside the mesh-valid / trained band on purpose.  Overridable via
-    # OOD_RE_MIN / OOD_RE_MAX, but pushing Re past the trained band drives y+
-    # out of wall-function validity and QC will reject the cases.
+    # Defaults stay inside the trained band; overridable via OOD_RE_MIN /
+    # OOD_RE_MAX (or --re-range).  The C-mesh sizes its first cell for the
+    # actual case Re (y+ ~ 0.8 held across the band) and the solver runs a
+    # two-stage startup continuation outside the trained envelope, so Re up
+    # to ~2e6 converges and passes QC (validated July 2026, see
+    # scripts/diagnose_robustness.py).
     "re_min": _env_float("OOD_RE_MIN", ENVELOPE["re_min"]),
     "re_max": _env_float("OOD_RE_MAX", ENVELOPE["re_max"]),
     # |AoA| beyond the trained +/-5 deg (capped to keep steady RANS convergeable).
