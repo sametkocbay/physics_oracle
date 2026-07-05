@@ -396,7 +396,10 @@ def patch_boundary_file(boundary_path: Path) -> None:
 def parse_check_mesh(log_text: str) -> dict:
     out = {"max_non_orthogonality": None, "max_skewness": None, "n_cells": None,
            "errors": [], "warnings": []}
-    m = re.search(r"Max\s+non-orthogonality\s*=\s*([\d.eE+-]+)", log_text)
+    # OF13 checkMesh prints "Mesh non-orthogonality Max: X average: Y";
+    # older versions print "Max non-orthogonality = X".  Accept both.
+    m = (re.search(r"non-orthogonality\s+Max:\s*([\d.eE+-]+)", log_text)
+         or re.search(r"Max\s+non-orthogonality\s*=\s*([\d.eE+-]+)", log_text))
     if m: out["max_non_orthogonality"] = float(m.group(1))
     m = re.search(r"Max\s+skewness\s*=\s*([\d.eE+-]+)", log_text)
     if m: out["max_skewness"] = float(m.group(1))

@@ -73,6 +73,13 @@ YPLUS_TARGET = 0.8           # wall y+ design target (held ~constant vs Re)
 RE_DESIGN = 5.0e5            # legacy fixed design Re (optional override only)
 GROWTH_MAX = 1.2             # cap on wall-normal geometric growth ratio (§4.2)
 N_LAYERS_CAP = 300           # upper bound on the adaptive wall-normal cell count
+WAKE_CUT_AR_CAP = 100.0      # max in-plane aspect ratio (dx / first spacing) of
+                             # the wake-cut first-layer cells.  With a global y1
+                             # first spacing the far-wake cut cells reached AR
+                             # ~30,000 and ~90 deg non-orthogonality (centroid
+                             # shifts of the slivers point the cell-to-cell
+                             # vector along the cut), flooring the p residual
+                             # and destabilising GAMG at high Re.
 
 
 # ---------------------------------------------------------------------------
@@ -249,12 +256,25 @@ def build_c_mesh_nodes(
     LOG.info("BL sizing: Re=%.3g  y+_target=%.2f  y1=%.3e  n_layers=%d  max_growth=%.3f",
              re_size, yplus_target, y1, n_layers, growth)
 
+    # Per-column first spacing: y1 on the airfoil (wall resolution), growing
+    # along the wake cut so the cut's first-layer cells keep in-plane aspect
+    # ratio <= WAKE_CUT_AR_CAP.  The cut is only a numerical interface in the
+    # far wake; resolving it at y1 produced AR ~30k slivers whose ~90 deg
+    # non-orthogonality floored the p residual (see WAKE_CUT_AR_CAP note).
+    # dx along the cut is mirror-symmetric (top strand i <-> bottom ni-1-i),
+    # so both sides of every cut face get the same first spacing.
+    dxs = np.gradient(s_te)                    # local streamwise spacing, TE->outlet
+    y1_col = np.full(ni, y1)
+    y1_wake = np.maximum(y1, dxs / WAKE_CUT_AR_CAP)
+    y1_col[:n_wake] = y1_wake[::-1]            # wake_top: outlet -> TE
+    y1_col[ni - n_wake:] = y1_wake             # wake_bot: TE -> outlet
+
     # Pure TFI grid: linear interpolation inner -> ff with geometric j-clustering.
     nj = n_layers + 1
     nodes = np.empty((ni, nj, 2))
     for i in range(ni):
         L = float(np.linalg.norm(ff[i] - inner[i]))
-        s = _geom_nodes(L, y1, n_layers)
+        s = _geom_nodes(L, y1_col[i], n_layers)
         eta = s / max(L, 1e-30)
         nodes[i, :, 0] = (1.0 - eta) * inner[i, 0] + eta * ff[i, 0]
         nodes[i, :, 1] = (1.0 - eta) * inner[i, 1] + eta * ff[i, 1]
